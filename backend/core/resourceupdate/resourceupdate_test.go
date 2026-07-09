@@ -588,7 +588,7 @@ func TestSkillWorkerCallsReviewWithoutPendingSkillResults(t *testing.T) {
 	}
 	worker.callers.Skill = func(_ context.Context, req algo.SkillReviewRequest) (*algo.SkillReviewResponse, int, error) {
 		captured = req
-		return &algo.SkillReviewResponse{Code: 0, Data: algo.SkillReviewData{Status: "running", RequestID: req.RequestID, TaskID: "review_task_1"}}, 200, nil
+		return &algo.SkillReviewResponse{Code: 0, Data: algo.SkillReviewData{Status: "completed", RequestID: req.RequestID, TaskID: "review_task_1"}}, 200, nil
 	}
 
 	result, err := worker.RunOnce(ctx)
@@ -608,14 +608,14 @@ func TestSkillWorkerCallsReviewWithoutPendingSkillResults(t *testing.T) {
 	if strings.Contains(string(capturedBody), "user_turn_count") || strings.Contains(string(capturedBody), "tool_call_count") {
 		t.Fatalf("skill review request must not expose internal threshold counts: %s", string(capturedBody))
 	}
+	if captured.MinUserTurns != 2 || captured.MinToolTurns != 2 {
+		t.Fatalf("skill review request should use backend thresholds, got %#v", captured)
+	}
 	if captured.SkillBaseDir != defaultSkillBaseDir {
 		t.Fatalf("unexpected skill_base_dir: %#v", captured)
 	}
 	if captured.FSBaseURL == "" {
 		t.Fatalf("expected fs_base_url in skill review request: %#v", captured)
-	}
-	if captured.MinUserTurns != 2 || captured.MinToolTurns != 2 {
-		t.Fatalf("skill review request should use backend thresholds, got %#v", captured)
 	}
 
 	var got orm.ResourceUpdateTask

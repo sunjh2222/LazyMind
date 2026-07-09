@@ -40,10 +40,10 @@ func (w *Worker) handleSkillGenerate(ctx context.Context, task orm.ResourceUpdat
 		UserID:       request.UserID,
 		StartTime:    request.StartTime,
 		EndTime:      request.EndTime,
-		SkillBaseDir: defaultSkillBaseDir,
-		FSBaseURL:    common.CoreSelfEndpoint(),
 		MinUserTurns: w.cfg.MinUserTurns,
 		MinToolTurns: w.cfg.MinToolTurns,
+		SkillBaseDir: defaultSkillBaseDir,
+		FSBaseURL:    common.CoreSelfEndpoint(),
 		ModelConfigs: modelConfigs,
 	})
 	if err != nil {
