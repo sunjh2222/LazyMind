@@ -286,14 +286,12 @@ func consumeConversationPreflight(ctx context.Context, db *gorm.DB, convID, pref
 	return db.WithContext(ctx).Model(&orm.Conversation{}).Where("id = ?", convID).Update("ext", raw).Error
 }
 
-func enforceWorkflowConversationSettings(ctx context.Context, db *gorm.DB, convID string) error {
+func ensureWorkflowConversationEnabled(ctx context.Context, db *gorm.DB, convID string) error {
 	if db == nil || strings.TrimSpace(convID) == "" {
 		return nil
 	}
-	return db.WithContext(ctx).Model(&orm.Conversation{}).Where("id = ?", convID).Updates(map[string]any{
-		"enable_plugin": true,
-		"plugin_mode":   "dynamic",
-	}).Error
+	return db.WithContext(ctx).Model(&orm.Conversation{}).Where("id = ?", convID).
+		Update("enable_plugin", true).Error
 }
 
 // HandlePluginStepCreated is the compatibility entry point for pre-v2
@@ -392,8 +390,8 @@ func launchPluginAttempt(
 			}); sErr != nil {
 				return fmt.Errorf("plugin: create session: %w", sErr)
 			}
-			if settingsErr := enforceWorkflowConversationSettings(ctx, tx, convID); settingsErr != nil {
-				return fmt.Errorf("plugin: enforce conversation workflow settings: %w", settingsErr)
+			if settingsErr := ensureWorkflowConversationEnabled(ctx, tx, convID); settingsErr != nil {
+				return fmt.Errorf("plugin: ensure conversation workflow enabled: %w", settingsErr)
 			}
 			if strings.TrimSpace(params.UserInput) != "" {
 				intentJSON, _ := json.Marshal(map[string]string{"text": params.UserInput})
@@ -449,8 +447,8 @@ func launchPluginAttempt(
 		if dsErr == nil && existingSess.Dismissed {
 			return sessionID, taskID, false, fmt.Errorf("plugin: session %s is dismissed, skipping step advancement", sessionID)
 		}
-		if settingsErr := enforceWorkflowConversationSettings(ctx, db, convID); settingsErr != nil {
-			return sessionID, taskID, false, fmt.Errorf("plugin: enforce conversation workflow settings: %w", settingsErr)
+		if settingsErr := ensureWorkflowConversationEnabled(ctx, db, convID); settingsErr != nil {
+			return sessionID, taskID, false, fmt.Errorf("plugin: ensure conversation workflow enabled: %w", settingsErr)
 		}
 		if legacyEvent {
 			if uErr := UpdateSessionCurrentStep(ctx, db, sessionID, stepID); uErr != nil {

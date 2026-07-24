@@ -615,13 +615,14 @@ def test_compact_step_name_index_has_names_but_no_graph_details(loaded_plugin):
 
 def test_active_injection_switches_tools_and_request_local_policy_per_turn(
         loaded_plugin, mock_agentic_config):
-    from lazymind.chat.plugin import plugin_manager
+    from lazymind.chat.plugin import plugin_loader, plugin_manager
     mock_agentic_config['enable_plugin'] = True
     plugin_context = {
         'session_id': 'session-1',
         'plugin_id': 'test-plugin',
         'current_step': 'step_a',
     }
+    assert plugin_loader.get_step_mode('test-plugin', 'step_b') == 'human'
 
     with (
         patch.object(plugin_manager, '_fetch_go_projection', return_value={'past': [], 'ready': ['step_b']}),
@@ -660,6 +661,7 @@ def test_active_injection_switches_tools_and_request_local_policy_per_turn(
     assert 'Current Plugin Execution Policy' not in dynamic_system_prompt
     assert 'Current Plugin Execution Policy' in auto_context
     assert 'Current Plugin Execution Policy' in dynamic_context
+    assert auto_result.agentic_config_patch['plugin_mode'] == 'auto'
     assert 'Plugin Step Name Index' in auto_context
     assert 'step_a(Step A)' in auto_context
     assert 'step_d(Step D)' in dynamic_context

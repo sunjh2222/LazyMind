@@ -211,33 +211,50 @@ func TestHandoffStepName_PrefersLabelThenID(t *testing.T) {
 	}
 }
 
-func TestEnforceWorkflowConversationSettings_EnablesApprovalMode(t *testing.T) {
+func TestEnsureWorkflowConversationEnabled_PreservesPluginMode(t *testing.T) {
 	db := newTestDB(t)
 	ctx := context.Background()
 	if err := db.DB.AutoMigrate(&orm.Conversation{}); err != nil {
 		t.Fatalf("migrate conversation: %v", err)
 	}
-	disabled := false
 	auto := "auto"
-	conversation := orm.Conversation{
-		ID: "conv-settings", DisplayName: "Workflow chat",
-		EnablePlugin: &disabled, PluginMode: &auto,
+	dynamic := "dynamic"
+	tests := []struct {
+		name string
+		mode *string
+	}{
+		{name: "auto", mode: &auto},
+		{name: "dynamic", mode: &dynamic},
+		{name: "inherited", mode: nil},
 	}
-	if err := db.DB.Create(&conversation).Error; err != nil {
-		t.Fatalf("create conversation: %v", err)
-	}
-	if err := enforceWorkflowConversationSettings(ctx, db.DB, conversation.ID); err != nil {
-		t.Fatalf("enforce settings: %v", err)
-	}
-	var got orm.Conversation
-	if err := db.DB.First(&got, "id = ?", conversation.ID).Error; err != nil {
-		t.Fatalf("reload conversation: %v", err)
-	}
-	if got.EnablePlugin == nil || !*got.EnablePlugin {
-		t.Fatalf("workflow was not enabled: %#v", got.EnablePlugin)
-	}
-	if got.PluginMode == nil || *got.PluginMode != "dynamic" {
-		t.Fatalf("plugin mode: %#v", got.PluginMode)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			disabled := false
+			conversation := orm.Conversation{
+				ID: "conv-settings-" + tc.name, DisplayName: "Workflow chat",
+				EnablePlugin: &disabled, PluginMode: tc.mode,
+			}
+			if err := db.DB.Create(&conversation).Error; err != nil {
+				t.Fatalf("create conversation: %v", err)
+			}
+			if err := ensureWorkflowConversationEnabled(ctx, db.DB, conversation.ID); err != nil {
+				t.Fatalf("ensure workflow enabled: %v", err)
+			}
+			var got orm.Conversation
+			if err := db.DB.First(&got, "id = ?", conversation.ID).Error; err != nil {
+				t.Fatalf("reload conversation: %v", err)
+			}
+			if got.EnablePlugin == nil || !*got.EnablePlugin {
+				t.Fatalf("workflow was not enabled: %#v", got.EnablePlugin)
+			}
+			if tc.mode == nil {
+				if got.PluginMode != nil {
+					t.Fatalf("inherited plugin mode was overwritten: %#v", got.PluginMode)
+				}
+			} else if got.PluginMode == nil || *got.PluginMode != *tc.mode {
+				t.Fatalf("plugin mode changed: got %#v want %q", got.PluginMode, *tc.mode)
+			}
+		})
 	}
 }
 

@@ -36,7 +36,7 @@ export default function ChatConfigPopover({
   );
   // Track whether we've already fetched defaults to avoid repeated requests.
   const fetchedRef = useRef(false);
-  const enforcedWorkflowConversationRef = useRef<string | null>(null);
+  const enabledWorkflowConversationRef = useRef<string | null>(null);
 
   // Sync external initialSettings into local state; reset fetch cache on conversation change.
   useEffect(() => {
@@ -51,28 +51,28 @@ export default function ChatConfigPopover({
     }
   }, [conversationId, initialSettings]);
 
-  // Starting/attaching a workflow makes approval mode authoritative for this
-  // conversation. Enforce it once per attached session; users may still switch
-  // between auto and approval afterwards, but cannot disable until it is removed.
+  // An attached workflow requires plugins to stay enabled, but it must not
+  // override the conversation's auto/approval execution preference.
   useEffect(() => {
     if (!hasPluginSession) {
-      enforcedWorkflowConversationRef.current = null;
+      enabledWorkflowConversationRef.current = null;
       return;
     }
     const key = conversationId || 'pending-conversation';
-    if (enforcedWorkflowConversationRef.current === key) return;
-    enforcedWorkflowConversationRef.current = key;
+    if (enabledWorkflowConversationRef.current === key) return;
+    enabledWorkflowConversationRef.current = key;
     const next: ConversationPluginSettings = {
       ...settings,
       enable_plugin: true,
-      plugin_mode: 'dynamic',
     };
     setSettings(next);
     onSave?.(next);
     if (conversationId && !conversationId.startsWith('temp_')) {
-      void ConversationSettingsApi().patchPluginSettings(conversationId, next).catch(() => {
-        enforcedWorkflowConversationRef.current = null;
-      });
+      void ConversationSettingsApi()
+        .patchPluginSettings(conversationId, { enable_plugin: true })
+        .catch(() => {
+          enabledWorkflowConversationRef.current = null;
+        });
     }
   }, [conversationId, hasPluginSession, onSave, settings]);
 
