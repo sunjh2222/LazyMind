@@ -644,7 +644,7 @@ jobs:
           import sys
 
           for arguments in [
-              ['run', '--source=algorithm', '-m', 'pytest', 'tests/algorithm/', '-v', '--durations=50'],
+              ['run', '--source=algorithm', '-m', 'pytest', 'tests/algorithm/', 'workflows/ppt-workflow/scripts/tests/test_partial_edit.py', '-v', '--durations=50'],
               ['html', '-d', 'htmlcov-algorithm'],
               ['xml', '-o', 'coverage-algorithm.xml'],
           ]:
