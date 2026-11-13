@@ -52,6 +52,12 @@ function nsisMacro(source, name) {
   return match[1];
 }
 
+function nsisFunction(source, name) {
+  const match = source.match(new RegExp(`Function ${name}\\b([\\s\\S]*?)FunctionEnd`));
+  assert.ok(match, `missing NSIS function ${name}`);
+  return match[1];
+}
+
 function writeSkillCatalogFixtures(root) {
   mkdirSync(path.join(root, "builtin-skills"), { recursive: true });
   writeFileSync(path.join(root, "builtin-skills", "catalog.json"), '{"schema_version":1,"skills":[]}\n');
@@ -393,6 +399,44 @@ test("Windows installer offers simple and full installation modes", () => {
   assert.match(pages, /PageCallbacks LMInstallTypePageCreate LMInstallTypePageLeave/);
   assert.match(install, /\$InstallTypeChoice == "full"[\s\S]*--installer-warmup/);
   assert.match(install, /Simple installation selected; bundled Python will be prepared on first launch/);
+});
+
+test("Windows installer offers long paths only during interactive setup before process cleanup", () => {
+  const source = readFileSync(installerScript, "utf8");
+  const header = nsisMacro(source, "customHeader");
+  const init = nsisMacro(source, "customInit");
+  const offer = nsisFunction(header, "LMOfferLongPaths");
+  const start = header.indexOf("Function LMOfferLongPaths");
+  const guard = header.lastIndexOf("!ifndef BUILD_UNINSTALLER", start);
+  assert.ok(guard >= 0 && header.indexOf("!else", guard) > start, "the optional action must be installer-only");
+  assert.match(init, /Call LMOfferLongPaths\s*$/);
+  assert.ok(init.indexOf("Call LMOfferLongPaths") > init.indexOf('"--purge-lazymind-local-data"'));
+  assert.ok(init.indexOf("Call LMOfferLongPaths") > init.indexOf("preflight --install-dir"));
+  assert.equal(source.match(/^\s*Call LMOfferLongPaths\s*$/gm)?.length, 1);
+  assert.match(offer, /^\s*IfSilent LMLongPathsReturn\s+Push \$0\s+SetRegView 64/);
+  assert.match(offer, /ClearErrors\s+ReadRegDWORD \$0 HKLM "SYSTEM\\CurrentControlSet\\Control\\FileSystem" "LongPathsEnabled"\s+IfErrors LMLongPathsPrompt\s+StrCmp \$0 1 LMLongPathsDone/);
+  assert.match(offer, /LMLongPathsPrompt:\s+MessageBox MB_YESNO\|MB_ICONQUESTION\|MB_DEFBUTTON2 [^\r\n]* \/SD IDNO IDYES LMLongPathsEnable\s+Goto LMLongPathsDone/);
+  assert.match(offer, /LMLongPathsDone:\s+SetRegView lastused\s+Pop \$0\s+LMLongPathsReturn:/);
+  for (const name of ["customUnInit", "customUnInstall", "customCheckAppRunning"]) {
+    assert.doesNotMatch(nsisMacro(source, name), /LMOfferLongPaths|LongPathsEnabled|reg\.exe/);
+  }
+  const config = readFileSync(electronBuilderConfig, "utf8");
+  assert.match(config, /requestedExecutionLevel:\s*"asInvoker"/);
+  assert.match(config, /perMachine:\s*false,[\s\S]*allowElevation:\s*false/);
+});
+
+test("Windows installer waits for a fixed system registry action and confirms the DWORD afterward", () => {
+  const source = readFileSync(installerScript, "utf8");
+  const offer = nsisFunction(nsisMacro(source, "customHeader"), "LMOfferLongPaths");
+  const enable = offer.slice(offer.indexOf("LMLongPathsEnable:"), offer.indexOf("LMLongPathsFailed:"));
+  const failed = offer.slice(offer.indexOf("LMLongPathsFailed:"), offer.indexOf("LMLongPathsDone:"));
+  assert.match(enable, /ClearErrors\s+ExecShellWait "runas" "\$SYSDIR\\reg\.exe" 'add "HKLM\\SYSTEM\\CurrentControlSet\\Control\\FileSystem" \/v LongPathsEnabled \/t REG_DWORD \/d 1 \/f \/reg:64' SW_HIDE\s+IfErrors LMLongPathsFailed/);
+  assert.match(enable, /IfErrors LMLongPathsFailed\s+ClearErrors\s+ReadRegDWORD \$0 HKLM "SYSTEM\\CurrentControlSet\\Control\\FileSystem" "LongPathsEnabled"\s+IfErrors LMLongPathsFailed\s+StrCmp \$0 1 LMLongPathsEnabled LMLongPathsFailed/);
+  assert.match(enable, /LMLongPathsEnabled:\s+MessageBox [^\r\n]+\s+Goto LMLongPathsDone/);
+  assert.match(failed, /MessageBox [^\r\n]+/);
+  assert.doesNotMatch(failed, /LMLongPathsEnabled|ExecShell|LMLongPathsEnable:/);
+  assert.equal(offer.match(/ExecShellWait /g)?.length, 1);
+  assert.doesNotMatch(offer, /WriteReg(?:DWORD|Str)|ExecShell\s|cmd\.exe|powershell|\$PLUGINSDIR|\$InstallerHelper|ReadEnvStr|force-stop|purge-local-data/);
 });
 
 test("Windows CI treats branches as non-tags without leaking git probe failures", () => {

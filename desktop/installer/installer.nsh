@@ -68,8 +68,50 @@
   LangString LMFullInstall ${LANG_SIMPCHINESE} "完整安装"
   LangString LMFullInstallHelp ${LANG_ENGLISH} "Expand Python files and warm up all local services before setup finishes, as in previous versions."
   LangString LMFullInstallHelp ${LANG_SIMPCHINESE} "安装时展开 Python 文件，并在安装结束前预热全部本地服务。"
+  LangString LMLongPathsPrompt ${LANG_ENGLISH} "Enable Windows long path support for the bundled Python runtime?$\r$\n$\r$\nThis changes a Windows system setting and requires administrator approval. Choose No to continue without making this change."
+  LangString LMLongPathsPrompt ${LANG_SIMPCHINESE} "是否为内置 Python 启用 Windows 长路径支持？$\r$\n$\r$\n这会修改 Windows 系统设置，并要求管理员确认。选择“否”将继续安装且不执行此项更改。"
+  LangString LMLongPathsEnabled ${LANG_ENGLISH} "The Windows long path setting is enabled. Restart related applications; a Windows restart may be required."
+  LangString LMLongPathsEnabled ${LANG_SIMPCHINESE} "Windows 长路径系统设置已启用。请重新启动相关程序；部分环境可能需要重启 Windows。"
+  LangString LMLongPathsFailed ${LANG_ENGLISH} "Windows long path support could not be confirmed. The request may have been cancelled or denied. Setup will continue; an administrator can enable the setting later."
+  LangString LMLongPathsFailed ${LANG_SIMPCHINESE} "未能确认已启用 Windows 长路径。操作可能已取消或被拒绝。安装将继续，你可稍后由管理员启用此设置。"
 
   !ifndef BUILD_UNINSTALLER
+  Function LMOfferLongPaths
+    IfSilent LMLongPathsReturn
+    Push $0
+    SetRegView 64
+    ClearErrors
+    ReadRegDWORD $0 HKLM "SYSTEM\CurrentControlSet\Control\FileSystem" "LongPathsEnabled"
+    IfErrors LMLongPathsPrompt
+    StrCmp $0 1 LMLongPathsDone
+
+  LMLongPathsPrompt:
+    MessageBox MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2 "$(LMLongPathsPrompt)" /SD IDNO IDYES LMLongPathsEnable
+    Goto LMLongPathsDone
+
+  LMLongPathsEnable:
+    ClearErrors
+    ExecShellWait "runas" "$SYSDIR\reg.exe" 'add "HKLM\SYSTEM\CurrentControlSet\Control\FileSystem" /v LongPathsEnabled /t REG_DWORD /d 1 /f /reg:64' SW_HIDE
+    IfErrors LMLongPathsFailed
+    ClearErrors
+    ReadRegDWORD $0 HKLM "SYSTEM\CurrentControlSet\Control\FileSystem" "LongPathsEnabled"
+    IfErrors LMLongPathsFailed
+    StrCmp $0 1 LMLongPathsEnabled LMLongPathsFailed
+
+  LMLongPathsEnabled:
+    MessageBox MB_OK|MB_ICONINFORMATION "$(LMLongPathsEnabled)" /SD IDOK
+    Goto LMLongPathsDone
+
+  LMLongPathsFailed:
+    MessageBox MB_OK|MB_ICONEXCLAMATION "$(LMLongPathsFailed)" /SD IDOK
+
+  LMLongPathsDone:
+    SetRegView lastused
+    Pop $0
+  LMLongPathsReturn:
+    ClearErrors
+  FunctionEnd
+
   Function LMInstallTypePageCreate
     !insertmacro MUI_HEADER_TEXT "$(LMInstallTypePageTitle)" "$(LMInstallTypePageText)"
     nsDialogs::Create 1018
@@ -216,6 +258,7 @@
     ${EndIf}
     StrCpy $InstallDataChoice "purge"
   ${EndIf}
+  Call LMOfferLongPaths
 !macroend
 
 !macro customPageAfterChangeDir
