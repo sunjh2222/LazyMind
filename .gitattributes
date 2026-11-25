@@ -1,5 +1,8 @@
 *.sh text eol=lf
 
+# The Knowledge Market pilot checks the exact bytes of these Markdown fixtures.
+tests/algorithm/fixtures/market_prebuilt/*.md text eol=lf
+
 # Builtin Skill packages are hashed byte-for-byte into the frozen lockfile.
 # Keep text source bytes stable when checked out on Windows.
 skills/** text=auto eol=lf

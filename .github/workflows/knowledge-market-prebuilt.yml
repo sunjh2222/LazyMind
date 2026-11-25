@@ -1,0 +1,102 @@
+name: Knowledge Market Prebuilt Demo
+
+on:
+  workflow_dispatch:
+    inputs:
+      pilot_snapshot:
+        description: Approved sample snapshot
+        type: choice
+        options:
+          - v1
+          - v2
+        default: v1
+      publish:
+        description: Publish the two sample documents to the ModelScope test dataset from the default branch
+        type: boolean
+        default: false
+  schedule:
+    # 03:17 China Standard Time. The publish job requires repository opt-in.
+    - cron: '17 19 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: knowledge-market-prebuilt-demo-inline-v1-ci
+  cancel-in-progress: false
+
+env:
+  DEMO_REPO: sunjh2222/lazymind-prebuilt-chunks-demo
+  DEMO_PREFIX: inline-v1/ci
+  DEMO_SOURCE: tests/algorithm/fixtures/market_prebuilt
+  DEMO_SNAPSHOT: ${{ github.event_name == 'workflow_dispatch' && inputs.pilot_snapshot || 'v1' }}
+  GIT_TERMINAL_PROMPT: '0'
+  PYTHONPATH: ${{ github.workspace }}/algorithm
+
+jobs:
+  dry-run:
+    if: github.event_name == 'workflow_dispatch' && !inputs.publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install the checked-out algorithm runtime
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+        run: |
+          python -m pip install ./algorithm/lazyllm -r algorithm/requirements.txt
+          python -c "from importlib.util import find_spec; from pathlib import Path; from shutil import copy2; copy2('algorithm/lazyllm/pyproject.toml', Path(find_spec('lazyllm').origin).parent / 'pyproject.toml')"
+      - name: Build the sample package without publishing
+        run: |
+          python scripts/publish_market_prebuilt.py \
+            --source-dir "$DEMO_SOURCE" --source-revision "$(git rev-parse HEAD)" \
+            --repo "$DEMO_REPO" --prefix "$DEMO_PREFIX" --pilot-snapshot "$DEMO_SNAPSHOT" \
+            --output-dir "$RUNNER_TEMP/knowledge-market-prebuilt"
+
+  publish:
+    if: >-
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
+      ((github.event_name == 'workflow_dispatch' && inputs.publish) ||
+       (github.event_name == 'schedule' && vars.LAZYMIND_MARKET_PREBUILT_SCHEDULE == 'true'))
+    environment: knowledge-market-prebuilt-demo
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Verify the configured test dataset
+        env:
+          PUBLICATION_REPO: ${{ vars.LAZYMIND_MARKET_PREBUILT_REPO }}
+        run: |
+          if [[ "$PUBLICATION_REPO" != "$DEMO_REPO" ]]; then
+            echo "::error::Set LAZYMIND_MARKET_PREBUILT_REPO to the approved test dataset in the knowledge-market-prebuilt-demo environment."
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install the checked-out algorithm runtime
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+        run: |
+          python -m pip install ./algorithm/lazyllm -r algorithm/requirements.txt
+          python -c "from importlib.util import find_spec; from pathlib import Path; from shutil import copy2; copy2('algorithm/lazyllm/pyproject.toml', Path(find_spec('lazyllm').origin).parent / 'pyproject.toml')"
+      - name: Publish and verify the sample package
+        env:
+          MODELSCOPE_API_TOKEN: ${{ secrets.MODELSCOPE_API_TOKEN }}
+        run: |
+          if [[ -z "$MODELSCOPE_API_TOKEN" ]]; then
+            echo "::error::MODELSCOPE_API_TOKEN is required in the knowledge-market-prebuilt-demo environment."
+            exit 1
+          fi
+          python scripts/publish_market_prebuilt.py \
+            --source-dir "$DEMO_SOURCE" --source-revision "$(git rev-parse HEAD)" \
+            --repo "$DEMO_REPO" --prefix "$DEMO_PREFIX" --pilot-snapshot "$DEMO_SNAPSHOT" --publish
