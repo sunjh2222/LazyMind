@@ -63,7 +63,7 @@ import { ALL_TAGS } from "@/modules/knowledge/constants/common";
 import {
   Dataset as LegacyDataset,
 } from "@/api/generated/knowledge-client";
-import type { Dataset as CoreDataset, EmbeddingIndexStatusResponse } from "@/api/generated/core-client";
+import type { Dataset as CoreDataset, EmbeddingIndexStatusResponse, InstallRequest } from "@/api/generated/core-client";
 type Dataset = LegacyDataset & Pick<CoreDataset, "paper_count" | "pdf_attachment_count">;
 import KnowledgeLibraryLogo from "@/modules/knowledge/components/KnowledgeLibraryLogo";
 import TextIndexManager from "@/modules/knowledge/components/TextIndexManager";
@@ -115,6 +115,7 @@ import {
   type OfficialKnowledgeBase,
 } from "./knowledgeSquareData";
 import KnowledgeMarketTaskModal from "./KnowledgeMarketTaskModal";
+import KnowledgeMarketInstallModal from "./KnowledgeMarketInstallModal";
 import KnowledgeMineFilterPopover from "./KnowledgeMineFilterPopover";
 import {
   getKnowledgeMineOrderBy,
@@ -352,6 +353,7 @@ const KnowledgePage: FC<KnowledgePageProps> = ({
   const cloudCatalogRequest = useRef<AbortController>();
   const cloudDetailRequest = useRef<AbortController>();
   const cloudCatalogAccount = useRef("");
+  const [installItem, setInstallItem] = useState<OfficialKnowledgeBase>();
   const [marketTaskModalOpen, setMarketTaskModalOpen] = useState(false);
   const [marketTaskRevision, setMarketTaskRevision] = useState(0);
   const [trackedMarketJobs, setTrackedMarketJobs] = useState<
@@ -1042,30 +1044,35 @@ const KnowledgePage: FC<KnowledgePageProps> = ({
   }, [marketTaskRefreshKey, t, trackMarketJob]);
 
   const handleOfficialInstall = useCallback(
-    async (item: OfficialKnowledgeBase) => {
+    (item: OfficialKnowledgeBase) => {
       if (createActionDisabled) {
         message.warning(createActionDisabledTooltip);
         return;
       }
-      try {
-        const task = await installKnowledgeMarketItem(item.id);
-        trackMarketJob({
-          jobId: task.job_id,
-          itemId: item.id,
-          jobType: "install",
-          name: item.name,
-        });
-        taskNotification.open({
-          ...marketTaskNoticeOptions,
-          message: t("knowledge.marketTaskAdded"),
-          description: t("knowledge.marketTaskAddedDescription", { name: item.name }),
-        });
-        void loadKnowledgeMarket();
-      } catch {
-        // The shared request interceptor displays the localized error.
-      }
+      setInstallItem(item);
     },
-    [createActionDisabled, createActionDisabledTooltip, loadKnowledgeMarket, t, taskNotification, trackMarketJob],
+    [createActionDisabled, createActionDisabledTooltip],
+  );
+  const closeOfficialInstall = useCallback(() => setInstallItem(undefined), []);
+  const submitOfficialInstall = useCallback(
+    async (item: OfficialKnowledgeBase, request?: InstallRequest) => {
+      const task = request
+        ? await installKnowledgeMarketItem(item.id, request, { silentError: true })
+        : await installKnowledgeMarketItem(item.id);
+      if (task.state === "succeeded") {
+        setMarketTaskRevision((value) => value + 1);
+        void loadKnowledgeMarket();
+        return;
+      }
+      trackMarketJob({ jobId: task.job_id, itemId: item.id, jobType: "install", name: item.name });
+      taskNotification.open({
+        ...marketTaskNoticeOptions,
+        message: t("knowledge.marketTaskAdded"),
+        description: t("knowledge.marketTaskAddedDescription", { name: item.name }),
+      });
+      void loadKnowledgeMarket();
+    },
+    [loadKnowledgeMarket, t, taskNotification, trackMarketJob],
   );
 
   const handleOfficialUpdate = useCallback(
@@ -1401,7 +1408,9 @@ const KnowledgePage: FC<KnowledgePageProps> = ({
               ? "knowledge.marketUpdateCompleted"
               : result.job.jobType === "updateAll"
                 ? "knowledge.updateAllChecked"
-                : "knowledge.marketTaskCompleted"),
+                : result.detail.index_progress
+                  ? "knowledge.marketInstallTextReady"
+                  : "knowledge.marketTaskCompleted"),
             description: isUpdate
               ? t("knowledge.marketUpdateCompletedDescription", { name: result.job.name })
               : result.job.name,
@@ -2207,6 +2216,8 @@ const KnowledgePage: FC<KnowledgePageProps> = ({
         onCreate={onUpdate}
       />
       <SyncKnowledgeBaseCreationFlow vm={syncCreateVm} hideProviderModal />
+      {installItem && <KnowledgeMarketInstallModal key={installItem.id} item={installItem}
+        onClose={closeOfficialInstall} onInstall={submitOfficialInstall} />}
       <KnowledgeMarketTaskModal
         open={marketTaskModalOpen}
         query={marketTasks}
@@ -2217,7 +2228,7 @@ const KnowledgePage: FC<KnowledgePageProps> = ({
             taskNotification.open({
               ...marketTaskNoticeOptions,
               message: t("knowledge.marketTaskAdded"),
-              description: t("knowledge.marketRetryStartedDescription", { name: retriedTask.name }),
+              description: t(retriedTask.index ? "knowledge.marketIndexRetryStarted" : "knowledge.marketRetryStartedDescription", { name: retriedTask.name }),
             });
           }
           finishedMarketJobIds.current.clear();

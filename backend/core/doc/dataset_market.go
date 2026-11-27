@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -38,6 +40,7 @@ const MarketInstallJobType = "knowledge_market_install"
 const (
 	MarketUpdateJobType    = "knowledge_market_update"
 	MarketUpdateAllJobType = "knowledge_market_update_all"
+	MarketIndexJobType     = "knowledge_market_index"
 )
 
 // activeMarketJobStatuses are the async job statuses that hold an in-flight
@@ -153,7 +156,7 @@ func HasActiveMarketJob(ctx context.Context, db *gorm.DB, userID, marketItemID s
 		Where("create_user_id = ? AND (status IN ? OR (status = 'canceled' AND lock_until > ?)) AND ((job_type IN ? AND resource_id = ?) OR (job_type = ? AND resource_id = ?))",
 			userID,
 			activeMarketJobStatuses, time.Now().UTC(),
-			[]string{MarketInstallJobType, MarketUpdateJobType},
+			[]string{MarketInstallJobType, MarketUpdateJobType, MarketIndexJobType},
 			marketItemID,
 			MarketUpdateAllJobType,
 			userID,
@@ -300,6 +303,14 @@ func marketKBDisplayName(userID, displayName, datasetID string) string {
 // dataset row and ACL memberships) without an HTTP request. A non-empty
 // datasetID reuses a previously created dataset (retry after partial failure).
 func CreateMarketDataset(ctx context.Context, userID, userName, datasetID, displayName, description string, tags []string) (*orm.Dataset, error) {
+	return createMarketDataset(ctx, userID, userName, datasetID, displayName, description, tags, "")
+}
+
+func CreatePrebuiltMarketDataset(ctx context.Context, userID, userName, datasetID, displayName, description string, tags []string) (*orm.Dataset, error) {
+	return createMarketDataset(ctx, userID, userName, datasetID, displayName, description, tags, ProcessingLevelChunked)
+}
+
+func createMarketDataset(ctx context.Context, userID, userName, datasetID, displayName, description string, tags []string, level string) (*orm.Dataset, error) {
 	displayName = strings.TrimSpace(displayName)
 	userID = strings.TrimSpace(userID)
 	if displayName == "" || userID == "" {
@@ -319,6 +330,15 @@ func CreateMarketDataset(ctx context.Context, userID, userName, datasetID, displ
 		var existing orm.Dataset
 		err := db.WithContext(ctx).Where("id = ? AND deleted_at IS NULL", datasetID).Take(&existing).Error
 		if err == nil {
+			if level == ProcessingLevelChunked && (existing.CreateUserID != userID || existing.ProcessingLevel != level) {
+				return nil, fmt.Errorf("prebuilt dataset identity does not match")
+			}
+			if level == ProcessingLevelChunked {
+				if st := acl.GetStore(); st != nil {
+					st.EnsureKB(existing.KbID, displayName, userID)
+					ensureDatasetCreatorMember(st, datasetID, userID)
+				}
+			}
 			return &existing, nil
 		}
 		if !isRecordNotFound(err) {
@@ -354,7 +374,24 @@ func CreateMarketDataset(ctx context.Context, userID, userName, datasetID, displ
 	}
 	var kbResp map[string]any
 	if err := common.ApiPost(ctx, kbURL, req, nil, &kbResp, 10*time.Second); err != nil {
-		return nil, fmt.Errorf("kb service create failed: %w", err)
+		var httpErr *common.HTTPError
+		if level != ProcessingLevelChunked || !errors.As(err, &httpErr) || httpErr.StatusCode != http.StatusConflict {
+			return nil, fmt.Errorf("kb service create failed: %w", err)
+		}
+		// An interrupted attempt may have created the remote KB before Core
+		// committed its row. Resume only the same owner's exact reservation.
+		var existing struct {
+			Data struct {
+				ID    string   `json:"kb_id"`
+				Owner string   `json:"owner_id"`
+				Algos []string `json:"algo_ids"`
+			} `json:"data"`
+		}
+		if readErr := common.ApiGet(ctx, kbURL+"/"+url.PathEscape(datasetID), nil, &existing, 10*time.Second); readErr != nil ||
+			existing.Data.ID != datasetID || existing.Data.Owner != userID ||
+			len(existing.Data.Algos) != 1 || existing.Data.Algos[0] != defaultMarketAlgoID {
+			return nil, fmt.Errorf("kb service create failed: %w", err)
+		}
 	}
 	kbID := datasetID
 	if v, ok := kbResp["kb_id"]; ok {
@@ -375,12 +412,16 @@ func CreateMarketDataset(ctx context.Context, userID, userName, datasetID, displ
 	// 2) Persist the dataset row.
 	now := time.Now().UTC()
 	parsers := fetchParsersByAlgoID(ctx, defaultMarketAlgoID)
-	extBytes, _ := json.Marshal(map[string]any{
+	ext := map[string]any{
 		"tags":      tags,
 		"algo_id":   defaultMarketAlgoID,
 		"algo_name": defaultMarketAlgoName,
 		"parsers":   parsers,
-	})
+	}
+	if level == ProcessingLevelChunked {
+		ext["prebuilt_market"] = true
+	}
+	extBytes, _ := json.Marshal(ext)
 	ds := &orm.Dataset{
 		ID:                     datasetID,
 		KbID:                   kbID,
@@ -399,6 +440,11 @@ func CreateMarketDataset(ctx context.Context, userID, userName, datasetID, displ
 			UpdatedAt:      now,
 		},
 	}
+	if level == ProcessingLevelChunked {
+		ds.ProcessingLevel = ProcessingLevelChunked
+		ds.EmbeddingModel = ""
+		ds.EmbeddingModelProvider = ""
+	}
 	if err := db.WithContext(ctx).Create(ds).Error; err != nil {
 		return nil, fmt.Errorf("create dataset failed: %w", err)
 	}
@@ -413,6 +459,13 @@ func CreateMarketDataset(ctx context.Context, userID, userName, datasetID, displ
 		Str("display_name", displayName).
 		Msg("market dataset created")
 	return ds, nil
+}
+
+func isPrebuiltMarketDataset(ds orm.Dataset) bool {
+	var extra struct {
+		Prebuilt bool `json:"prebuilt_market"`
+	}
+	return json.Unmarshal(ds.Ext, &extra) == nil && extra.Prebuilt
 }
 
 // isRecordNotFound reports whether err is a gorm record-not-found error.

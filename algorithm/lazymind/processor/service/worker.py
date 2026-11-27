@@ -19,7 +19,12 @@ from lazyllm.tools.rag.parsing_service import DocumentProcessorWorker  # noqa: E
 from lazyllm.tools.rag.doc_node import ImageDocNode, MetadataMode  # noqa: E402
 from lazyllm.tools.rag.store import LAZY_IMAGE_GROUP, LAZY_ROOT_NAME  # noqa: E402
 from lazymind.config import config as _cfg  # noqa: E402
+from lazymind.processor.service import market_index_fence  # noqa: E402
 from lazymind.processor.service.db import require_shared_db_config  # noqa: E402
+from lazymind.processor.service.prebuilt_import import PREBUILT_GROUPS, import_prebuilt_documents  # noqa: E402
+from lazymind.processor.service.market_index_fence import (  # noqa: E402
+    MARKET_INDEX_CONFIRMATION, MARKET_INDEX_GROUPS, require_market_text_nodes, verify_market_index_confirmation,
+)
 
 
 _TEXT_REEMBED_GROUPS = frozenset(('block', 'line', 'code', 'doc-summary'))
@@ -244,6 +249,9 @@ if not getattr(DocumentProcessorWorker._Impl, '_lazymind_isolated', False):
             from lazymind.parsing.service.embedding_input_compat import install
             install()
             from lazymind.parsing.service.embedding_reset import index_state, IndexBusy
+            market_task = market_index_fence.market_index_task.get()
+            if market_task is not None:
+                verify_market_index_confirmation(*market_task)
             state = index_state()
             expected = getattr(self, '_lazymind_task_generation', None)
             # Drop stale work before constructing a processor: chunk-only reparses
@@ -278,12 +286,29 @@ if not getattr(DocumentProcessorWorker._Impl, '_lazymind_isolated', False):
             # Reembedding reads retained vectors before its first write. Initialize
             # the vector connection now rather than letting HybridStore.get hit a
             # freshly deserialized Milvus store without a client pool.
-            if getattr(self, '_lazymind_task_indexes', True) and hasattr(processor._store, '_seg_init'):
+            if (market_task is None and getattr(self, '_lazymind_task_indexes', True)
+                    and hasattr(processor._store, '_seg_init')):
                 processor._store._seg_init()
                 processor._store._vec_init()
             return _install_deferred_group_guard(_install_text_reembed_guard(processor))
 
+        def _load_reader_from_db(self):
+            if market_index_fence.market_index_task.get() is not None:
+                return None
+            return _BaseDocumentWorkerImpl._load_reader_from_db(self)
+
         def _exec_reparse_task(self, processor, task_id, payload, node_groups, name_to_id, reader):
+            market_task = market_index_fence.market_index_task.get()
+            if market_task is not None:
+                require_market_text_nodes(processor._store, node_groups, name_to_id,
+                                          payload['file_infos'], payload['kb_id'])
+                verify_market_index_confirmation(*market_task)
+                processor._store._vec_init()
+                retained_groups = {name: node_groups[name] for name in PREBUILT_GROUPS}
+                retained_ids = {name: name_to_id[name] for name in MARKET_INDEX_GROUPS}
+                return _BaseDocumentWorkerImpl._exec_reparse_task(
+                    self, processor, task_id, payload, retained_groups, retained_ids, reader=None)
+
             # The document service expands an all-groups selection into names,
             # including the source root. Preserve full rebuild semantics: otherwise
             # the base worker drops that root and only reslices stale source nodes.
@@ -309,8 +334,35 @@ if not getattr(DocumentProcessorWorker._Impl, '_lazymind_isolated', False):
         def _exec_add_task(self, processor, task_id, payload, node_groups, name_to_id, reader,
                            extractor_names=None):
             _recover_owned_node_groups(self, task_id, payload)
-            return _BaseDocumentWorkerImpl._exec_add_task(
-                self, processor, task_id, payload, node_groups, name_to_id, reader, extractor_names)
+            file_infos = payload.get('file_infos') or []
+            if not any('prebuilt_path' in (info.get('metadata') or {}) for info in file_infos):
+                return _BaseDocumentWorkerImpl._exec_add_task(
+                    self, processor, task_id, payload, node_groups, name_to_id, reader, extractor_names)
+
+            kb_id = payload.get('kb_id')
+            doc_ids = [info.get('doc_id') for info in file_infos]
+            if not kb_id or not all(doc_ids) or len(set(doc_ids)) != len(doc_ids):
+                raise ValueError('Prebuilt text import requires a knowledge base and distinct document IDs')
+            groups = [name_to_id[group] for group in PREBUILT_GROUPS if group in name_to_id]
+            _, pending = self._wait_and_decide_ng(doc_ids, groups, kb_id) if groups else (set(), set())
+            pending = list(pending)
+            if groups and not pending:
+                return
+            if pending:
+                self._write_ng_status_batch(doc_ids, pending, kb_id, 'WORKING')
+            try:
+                if payload.get('processing_level') != 'chunked':
+                    raise ValueError('Prebuilt text import requires chunked processing')
+                paths = [(info.get('metadata') or {}).get('prebuilt_path') for info in file_infos]
+                if not all(isinstance(path, str) and path for path in paths):
+                    raise ValueError('A prebuilt text task requires an object path for each document')
+                import_prebuilt_documents(processor._store, file_infos, kb_id)
+                if pending:
+                    self._write_ng_status_batch(doc_ids, pending, kb_id, 'SUCCESS')
+            except Exception as exc:
+                if pending:
+                    self._write_ng_status_batch(doc_ids, pending, kb_id, 'FAILED', str(exc))
+                raise
 
         def _poll_task(self):
             from lazymind.processor.service.scheduling import claim_ingestion_first
@@ -335,9 +387,20 @@ if not getattr(DocumentProcessorWorker._Impl, '_lazymind_isolated', False):
             from lazymind.parsing.service.embedding_reset import index_lock
             self._lazymind_task_reparse = task_type == 'DOC_REPARSE'
             self._lazymind_task_indexes = payload.get('processing_level', 'indexed') == 'indexed'
-            self._lazymind_task_generation = (payload.get('llm_config') or {}).get('_embedding_generation')
-            with index_lock():
-                return _BaseDocumentWorkerImpl._run_task(self, task_id, task_type, payload, from_queue)
+            model_config = payload.get('llm_config') or {}
+            self._lazymind_task_generation = model_config.get('_embedding_generation')
+            market_task = (task_type, payload) if MARKET_INDEX_CONFIRMATION in model_config else None
+            token = market_index_fence.market_index_task.set(market_task)
+            try:
+                if market_task is not None:
+                    # The reserved confirmation is not a model role and must not enter model routing.
+                    model_config = dict(model_config)
+                    model_config.pop(MARKET_INDEX_CONFIRMATION)
+                    payload = {**payload, 'llm_config': model_config}
+                with index_lock():
+                    return _BaseDocumentWorkerImpl._run_task(self, task_id, task_type, payload, from_queue)
+            finally:
+                market_index_fence.market_index_task.reset(token)
 
     DocumentProcessorWorker._Impl = _IsolatedDocumentWorkerImpl
 

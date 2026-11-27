@@ -4,7 +4,7 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { deferred, desktopTestTranslation as t, installDesktopTestDOM } from "@/test/desktopResourceFixtures";
 
-const mocks = vi.hoisted(() => ({ mode: "desktop", session: vi.fn(), get: vi.fn(), post: vi.fn(), local: vi.fn(), detail: vi.fn(), installs: vi.fn(), install: vi.fn(), update: vi.fn() }));
+const mocks = vi.hoisted(() => ({ mode: "desktop", session: vi.fn(), get: vi.fn(), post: vi.fn(), local: vi.fn(), detail: vi.fn(), installs: vi.fn(), installPreview: vi.fn(), install: vi.fn(), update: vi.fn() }));
 vi.mock("react-i18next", async (load) => ({ ...await load<typeof import("react-i18next")>(), useTranslation: () => ({ t }) }));
 vi.mock("@/runtime/mode", async (load) => ({ ...await load<object>(), isDesktopRuntime: () => mocks.mode === "desktop" }));
 vi.mock("@/runtime/cloud/session", () => ({ getCloudSession: mocks.session, isCloudBusinessAvailable: (session: any) => session?.state === "signed_in" && session?.configured !== false && session?.reachability !== "unreachable", LAZYMIND_CLOUD_SESSION_CHANGED_EVENT: "lazymind:cloud-session-changed" }));
@@ -12,7 +12,7 @@ vi.mock("@/modules/knowledge/api/knowledgeMarket", () => ({
   listKnowledgeMarket: mocks.local, getKnowledgeMarketItem: mocks.detail, listKnowledgeMarketInstalls: mocks.installs,
   listKnowledgeMarketDomains: vi.fn().mockResolvedValue({ domains: { industry: ["本地域"], evaluation: [] } }),
   listKnowledgeMarketTasks: vi.fn().mockResolvedValue({ items: [], total: 0 }), getKnowledgeMarketTask: vi.fn(),
-  installKnowledgeMarketItem: mocks.install, updateKnowledgeMarketItem: mocks.update, updateAllKnowledgeMarketItems: vi.fn(),
+  getKnowledgeMarketInstallPreview: mocks.installPreview, installKnowledgeMarketItem: mocks.install, updateKnowledgeMarketItem: mocks.update, updateAllKnowledgeMarketItems: vi.fn(),
 }));
 vi.mock("@/components/request", () => ({ BASE_URL: "", axiosInstance: { defaults: {}, get: mocks.get, post: mocks.post, request: (options: { url: string }) => mocks.get(options.url, options) }, getLocalizedErrorMessage: () => "请求失败", localizeErrorCode: () => "请求失败" }));
 vi.mock("@/modules/knowledge/components/SyncKnowledgeBaseCreationFlow", () => ({ default: () => null, useSyncKnowledgeBaseCreation: () => ({}) }));
@@ -63,7 +63,7 @@ describe("Desktop 知识广场 combined sources without deduplication", () => {
     const dialog = await screen.findByRole("dialog");
     await waitFor(() => expect(within(dialog).getByText("云端独有示例问题")).toBeVisible());
     expect(mocks.get.mock.calls.some(([url]) => String(url).endsWith("/cloud/knowledge-market/items/same-key"))).toBe(true);
-    expect(mocks.detail).not.toHaveBeenCalled(); expect(mocks.install).not.toHaveBeenCalled(); expect(mocks.post).not.toHaveBeenCalled();
+    expect(mocks.detail).not.toHaveBeenCalled(); expect(mocks.installPreview).not.toHaveBeenCalled(); expect(mocks.install).not.toHaveBeenCalled(); expect(mocks.post).not.toHaveBeenCalled();
     expect(within(dialog).queryByRole("button", { name: "安装" })).not.toBeInTheDocument();
     expect(within(dialog).getByText("7", { exact: true })).toBeVisible();
   });

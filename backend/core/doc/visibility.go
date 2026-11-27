@@ -245,15 +245,29 @@ func (s *DocumentVisibilityService) Filter(ctx context.Context, caller DatasetCa
 		if dataset == nil {
 			continue
 		}
-		var count int64
-		if err := s.db.WithContext(ctx).Model(&orm.Document{}).Where("dataset_id = ? AND (id = ? OR lazyllm_doc_id = ?) AND lazyllm_doc_id <> '' AND deleted_at IS NULL", dataset.ID, ref.DocumentID, ref.DocumentID).Count(&count).Error; err != nil {
+		var rows []struct {
+			LazyllmDocID string
+			Ext          json.RawMessage
+		}
+		if err := s.db.WithContext(ctx).Model(&orm.Document{}).Select("lazyllm_doc_id, ext").
+			Where("dataset_id = ? AND (id = ? OR lazyllm_doc_id = ?) AND lazyllm_doc_id <> '' AND deleted_at IS NULL", dataset.ID, ref.DocumentID, ref.DocumentID).
+			Limit(2).Find(&rows).Error; err != nil {
 			return nil, err
 		}
-		if count == 1 {
+		// A stable Core ID can be the retired algorithm ID after a version
+		// switch. Retrieval references to a versioned document must match
+		// the current binding. Separate document reads use the Core ID.
+		if len(rows) == 1 && (rows[0].LazyllmDocID == ref.DocumentID || !isVersionedPrebuiltDocument(rows[0].Ext)) {
 			allowed = append(allowed, ref)
 		}
 	}
 	return allowed, nil
+}
+
+func isVersionedPrebuiltDocument(raw json.RawMessage) bool {
+	var ext documentExt
+	_ = json.Unmarshal(raw, &ext)
+	return ext.PrebuiltVersioned
 }
 
 // FilterDocumentVisibilityHTTP is a read-only batch authorization boundary for
@@ -302,17 +316,25 @@ func (s *DocumentVisibilityService) filterCurrentIndexes(ctx context.Context, re
 	for _, ref := range refs {
 		ids = append(ids, ref.DocumentID)
 	}
-	var rows []struct{ DatasetID, KbID, ID, LazyllmDocID string }
-	err := s.db.WithContext(ctx).Table("document_processing_states p").
-		Select("d.dataset_id,k.kb_id,d.id,d.lazyllm_doc_id").
-		Joins("JOIN documents d ON d.id=p.document_id AND d.dataset_id=p.dataset_id").
+	var rows []struct {
+		DatasetID, KbID, ID, LazyllmDocID string
+		IndexStatus, EmbeddingVersion     string
+		Ext                               json.RawMessage
+	}
+	err := s.db.WithContext(ctx).Table("documents d").
+		Select("d.dataset_id,k.kb_id,d.id,d.lazyllm_doc_id,d.ext,COALESCE(p.index_status,'') AS index_status,COALESCE(p.embedding_version,'') AS embedding_version").
+		Joins("LEFT JOIN document_processing_states p ON d.id=p.document_id AND d.dataset_id=p.dataset_id").
 		Joins("JOIN datasets k ON k.id=d.dataset_id").
-		Where("(d.id IN ? OR d.lazyllm_doc_id IN ?) AND p.embedding_version=?", ids, ids, embeddingVersionRebuildRequired).Scan(&rows).Error
+		Where("d.id IN ? OR d.lazyllm_doc_id IN ?", ids, ids).Scan(&rows).Error
 	if err != nil {
 		return nil, err
 	}
 	stale := map[DocumentVisibilityRef]bool{}
 	for _, row := range rows {
+		if row.EmbeddingVersion != embeddingVersionRebuildRequired &&
+			(row.IndexStatus == "succeeded" || !isVersionedPrebuiltDocument(row.Ext)) {
+			continue
+		}
 		for _, kb := range []string{row.DatasetID, row.KbID} {
 			for _, doc := range []string{row.ID, row.LazyllmDocID} {
 				if kb != "" && doc != "" {

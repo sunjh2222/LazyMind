@@ -21,6 +21,20 @@ var ErrMarketProcessing = errors.New("knowledge base task is running, retry late
 // SnapshotMarketTaskHistory freezes terminal results before a retry, update or
 // uninstall can replace/delete the files. Both lifecycle owners use this path.
 func SnapshotMarketTaskHistory(ctx context.Context, db *gorm.DB, install *orm.KnowledgeMarketInstall) error {
+	return snapshotMarketTaskHistory(ctx, db, install, "")
+}
+
+// SnapshotPrebuiltReplayHistory preserves the unknown result of the validated
+// predecessor before replaying its saved submission. Other jobs must still
+// have terminal file states before their history can be frozen.
+func SnapshotPrebuiltReplayHistory(ctx context.Context, db *gorm.DB, install *orm.KnowledgeMarketInstall, predecessor string) error {
+	if predecessor == "" {
+		return ErrMarketProcessing
+	}
+	return snapshotMarketTaskHistory(ctx, db, install, predecessor)
+}
+
+func snapshotMarketTaskHistory(ctx context.Context, db *gorm.DB, install *orm.KnowledgeMarketInstall, predecessor string) error {
 	if install == nil {
 		return nil
 	}
@@ -32,7 +46,8 @@ func SnapshotMarketTaskHistory(ctx context.Context, db *gorm.DB, install *orm.Kn
 		return err
 	}
 	current := MarketParseProgress(ctx, db, install.DatasetID, cfg.TaskIDs, cfg.Failures)
-	if current.Total > 0 && (current.State == "parsing" || current.State == "pending" || current.State == "unknown") {
+	if current.Total > 0 && (current.State == "parsing" || current.State == "pending" ||
+		(current.State == "unknown" && predecessor == "")) {
 		return ErrMarketProcessing
 	}
 	var jobs []orm.AsyncJob
@@ -63,7 +78,8 @@ func SnapshotMarketTaskHistory(ctx context.Context, db *gorm.DB, install *orm.Kn
 				parse.State = "done"
 			}
 		}
-		if parse.Total > 0 && (parse.State == "pending" || parse.State == "parsing" || parse.State == "unknown") {
+		if parse.Total > 0 && (parse.State == "pending" || parse.State == "parsing" ||
+			(parse.State == "unknown" && job.ID != predecessor)) {
 			return ErrMarketProcessing
 		}
 		var result map[string]any

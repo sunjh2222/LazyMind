@@ -97,6 +97,7 @@ export default function KnowledgeSquare({
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailError, setDetailError] = useState(false);
   const detailRequestRef = useRef(0);
+  const detailInstall = useRef<OfficialKnowledgeBase>();
   const detailActive = Boolean(
     detailItem && (detailItem.active || progressByItem[detailItem.id] !== undefined),
   );
@@ -357,8 +358,14 @@ export default function KnowledgeSquare({
         className="knowledge-square-detail-modal"
         width={680}
         open={Boolean(detailItem)}
+        destroyOnHidden
         title={detailItem?.name}
         centered
+        afterClose={() => {
+          const item = detailInstall.current;
+          detailInstall.current = undefined;
+          if (item) onInstall(item);
+        }}
         footer={
           detailItem ? (
             <>
@@ -379,7 +386,7 @@ export default function KnowledgeSquare({
                 title={actionDisabled ? String(actionDisabledReason || "") : undefined}
                 onClick={() => {
                   if (detailItem.installed) onUpdate(detailItem);
-                  else onInstall(detailItem);
+                  else detailInstall.current = detailItem;
                   closeDetail();
                 }}
               >

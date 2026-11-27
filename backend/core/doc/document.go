@@ -645,6 +645,9 @@ func streamDocumentFile(w http.ResponseWriter, r *http.Request, inline bool) {
 		common.ReplyErr(w, fmt.Sprintf("%s: %v", "document not found", err), http.StatusNotFound)
 		return
 	}
+	if !requirePrebuiltDocumentReady(w, r, row, ext) {
+		return
+	}
 	storedPath := previewPathForContent(ext)
 	if storedPath == "" {
 		common.ReplyErr(w, "document file not found", http.StatusNotFound)
@@ -872,6 +875,10 @@ func GetDocument(w http.ResponseWriter, r *http.Request) {
 		}
 		doc.ProcessingStatus = DocumentProcessingStatus(metadata.ProcessingLevel, metadata.ProcessingState)
 		doc.ProcessingError = metadata.ProcessingError
+		if doc.PrebuiltSourcePath != "" && metadata.ProcessingState.ChunkStatus == "succeeded" {
+			doc.FileURL = staticFileURLFromFullPath(originalStoredPathFromRow(rr))
+			doc.DownloadFileURL = doc.FileURL
+		}
 	}
 	setDocumentURI(&doc)
 	common.ReplyJSON(w, doc)
@@ -1555,6 +1562,8 @@ type Doc struct {
 	URI                    string                `json:"uri"`
 	FileURL                string                `json:"file_url,omitempty"`
 	DownloadFileURL        string                `json:"download_file_url,omitempty"`
+	PrebuiltSourcePath     string                `json:"prebuilt_source_path,omitempty"`
+	PrebuiltSourceURL      string                `json:"prebuilt_source_url,omitempty"`
 	Columns                []DocumentTableColumn `json:"columns"`
 	CreateTime             string                `json:"create_time"`
 	UpdateTime             string                `json:"update_time"`
@@ -2659,6 +2668,13 @@ func docFromRow(row mergedDocRow) Doc {
 	if extPath := parseStoredPathFromExt(row.Ext); extPath != "" {
 		previewPath = extPath
 	}
+	var ext documentExt
+	_ = json.Unmarshal(row.Ext, &ext)
+	if ext.PrebuiltPath != "" {
+		// Only the detail endpoint issues a preview URL after observing the
+		// worker's success. An installing library may already have document rows.
+		previewPath, originalPath = "", ""
+	}
 	ct := ""
 	ut := ""
 	if !row.BaseCreatedAt.IsZero() {
@@ -2683,6 +2699,8 @@ func docFromRow(row mergedDocRow) Doc {
 		URI:                    "",
 		FileURL:                staticFileURLFromFullPath(previewPath),
 		DownloadFileURL:        staticFileURLFromFullPath(originalPath),
+		PrebuiltSourcePath:     ext.PrebuiltSourcePath,
+		PrebuiltSourceURL:      ext.PrebuiltSourceURL,
 		Columns:                []DocumentTableColumn{},
 		CreateTime:             ct,
 		UpdateTime:             ut,

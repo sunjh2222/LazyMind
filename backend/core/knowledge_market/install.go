@@ -27,20 +27,31 @@ const installJobType = doc.MarketInstallJobType
 
 // installJobPayload carries everything the async install job needs.
 type installJobPayload struct {
-	MarketItemID string `json:"market_item_id"`
-	UserID       string `json:"user_id"`
-	UserName     string `json:"user_name"`
-	Revision     string `json:"revision,omitempty"`
+	MarketItemID               string                    `json:"market_item_id"`
+	UserID                     string                    `json:"user_id"`
+	UserName                   string                    `json:"user_name"`
+	Revision                   string                    `json:"revision,omitempty"`
+	OriginalSource             bool                      `json:"original_source,omitempty"`
+	Prebuilt                   *prebuiltRelease          `json:"prebuilt,omitempty"`
+	ProcessingLevel            string                    `json:"processing_level,omitempty"`
+	IndexConfirmation          *installIndexConfirmation `json:"index_confirmation,omitempty"`
+	PrebuiltRetryTasks         []string                  `json:"prebuilt_retry_tasks,omitempty"`
+	PrebuiltRetryAttempt       string                    `json:"prebuilt_retry_attempt,omitempty"`
+	indexConfirmationExpiresAt time.Time
 }
 
 // installConfig is the runtime file snapshot persisted on the install row; it
 // is the diff baseline for future update jobs.
 type installConfig struct {
-	Revision string                  `json:"revision"`
-	Commit   string                  `json:"commit,omitempty"` // git HEAD; update diff baseline
-	TaskIDs  []string                `json:"task_ids,omitempty"`
-	Failures []doc.MarketFileFailure `json:"failures,omitempty"`
-	Files    []fileSnapshot          `json:"files"`
+	Revision              string                  `json:"revision"`
+	Commit                string                  `json:"commit,omitempty"` // git HEAD; update diff baseline
+	TaskIDs               []string                `json:"task_ids,omitempty"`
+	Failures              []doc.MarketFileFailure `json:"failures,omitempty"`
+	Files                 []fileSnapshot          `json:"files"`
+	Prebuilt              *prebuiltRelease        `json:"prebuilt,omitempty"`
+	CandidateDatasetID    string                  `json:"candidate_dataset_id,omitempty"`
+	PrebuiltDocumentTasks map[string]string       `json:"prebuilt_document_tasks,omitempty"`
+	IndexDispatchJobID    string                  `json:"index_dispatch_job_id,omitempty"`
 }
 
 type fileSnapshot struct {
@@ -64,13 +75,14 @@ func MarketInstall(w http.ResponseWriter, r *http.Request) {
 		common.ReplyErr(w, "market_item_id and X-User-Id are required", http.StatusBadRequest)
 		return
 	}
+	request, err := decodeInstallRequest(w, r)
+	if err != nil {
+		common.ReplyErr(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	var item orm.KnowledgeMarketItem
 	if err := db.WithContext(r.Context()).Where("id = ? AND status = ?", marketItemID, "published").Take(&item).Error; err != nil {
 		replyServiceError(w, err)
-		return
-	}
-	if strings.TrimSpace(item.PackageURL) == "" {
-		common.ReplyErr(w, "knowledge base has no download package configured", http.StatusBadRequest)
 		return
 	}
 	// Reject a second install/update while one is already in flight for the
@@ -85,27 +97,88 @@ func MarketInstall(w http.ResponseWriter, r *http.Request) {
 		common.ReplyErr(w, "knowledge base task is running, retry later", http.StatusConflict)
 		return
 	}
+	previous, err := loadMarketInstallRow(r.Context(), db, userID, marketItemID)
+	if err != nil {
+		replyServiceError(w, err)
+		return
+	}
+	cfg := decodeInstallConfig(previous)
+	payload := installJobPayload{MarketItemID: marketItemID, UserID: userID, UserName: userName, Revision: item.PackageRevision}
+	if request.ProcessingLevel == doc.ProcessingLevelIndexed {
+		if prebuiltReleaseURL(item) == "" || (previous != nil && previous.DatasetID != "" && cfg.Prebuilt == nil) {
+			common.ReplyErr(w, "indexed confirmation requires a prebuilt install", http.StatusBadRequest)
+			return
+		}
+		payload.Prebuilt, payload.IndexConfirmation, payload.indexConfirmationExpiresAt, err =
+			confirmIndexedInstall(r.Context(), db, item, userID, request.ConfirmationToken)
+		if err != nil {
+			switch {
+			case errors.Is(err, errInvalidInstallConfirmation):
+				common.ReplyErr(w, err.Error(), http.StatusBadRequest)
+			case errors.Is(err, errStaleInstallConfirmation):
+				replyStaleInstallConfirmation(w)
+			default:
+				common.ReplyErr(w, "could not verify prebuilt knowledge release", http.StatusBadGateway)
+			}
+			return
+		}
+		if cfg.Prebuilt != nil && *cfg.Prebuilt != *payload.Prebuilt {
+			replyStaleInstallConfirmation(w)
+			return
+		}
+		payload.ProcessingLevel = doc.ProcessingLevelIndexed
+	} else if cfg.Prebuilt != nil {
+		payload.Prebuilt = cfg.Prebuilt
+	} else if releaseURL := prebuiltReleaseURL(item); releaseURL != "" && (previous == nil || previous.DatasetID == "") {
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		defer cancel()
+		payload.Prebuilt, err = readPrebuiltRelease(ctx, releaseURL, item.ID)
+		if err != nil {
+			log.Logger.Warn().Err(err).Str("market_item_id", item.ID).Msg("could not pin prebuilt knowledge release")
+			common.ReplyErr(w, "could not read prebuilt knowledge release", http.StatusBadGateway)
+			return
+		}
+	} else {
+		if request.ProcessingLevel != "" {
+			common.ReplyErr(w, "processing_level requires a prebuilt install", http.StatusBadRequest)
+			return
+		}
+		if strings.TrimSpace(item.PackageURL) == "" {
+			common.ReplyErr(w, "knowledge base has no download package configured", http.StatusBadRequest)
+			return
+		}
+		payload.OriginalSource = true
+	}
+	if payload.Prebuilt != nil && payload.ProcessingLevel == "" {
+		payload.ProcessingLevel = doc.ProcessingLevelChunked
+	}
+	if cfg.Prebuilt != nil {
+		planPrebuiltRetry(&payload, parseProgress(r, db, previous))
+	}
 	job, err := enqueueMarketItem(r.Context(), db, asyncjob.EnqueueRequest{
 		JobType:        installJobType,
 		ResourceType:   "knowledge_market_item",
 		ResourceID:     marketItemID,
 		IdempotencyKey: "kb_install:" + marketItemID + ":" + userID,
-		Payload: installJobPayload{
-			MarketItemID: marketItemID,
-			UserID:       userID,
-			UserName:     userName,
-			Revision:     item.PackageRevision,
-		},
+		Payload:        payload,
 		SkipSucceeded:  true,
 		MaxAttempts:    2,
 		CreateUserID:   userID,
 		CreateUserName: userName,
 	}, "")
 	if err != nil {
+		if errors.Is(err, errStaleInstallConfirmation) || (!payload.indexConfirmationExpiresAt.IsZero() && common.IsSQLiteBusy(err)) {
+			replyStaleInstallConfirmation(w)
+			return
+		}
 		replyServiceError(w, err)
 		return
 	}
 	common.ReplyOK(w, map[string]any{"job_id": job.ID, "state": "pending"})
+}
+
+func replyStaleInstallConfirmation(w http.ResponseWriter) {
+	common.ReplyErrWithData(w, errStaleInstallConfirmation.Error(), map[string]string{"reason": "install_confirmation_stale"}, http.StatusConflict)
 }
 
 // RegisterAsyncJobs registers the knowledge market background jobs.
@@ -113,6 +186,7 @@ func RegisterAsyncJobs() {
 	asyncjob.Register(installJobType, HandleInstallJob)
 	asyncjob.Register(updateJobType, HandleUpdateJob)
 	asyncjob.Register(updateAllJobType, HandleUpdateAllJob)
+	asyncjob.Register(doc.MarketIndexJobType, handlePrebuiltIndexJob)
 }
 
 // HandleInstallJob runs the install pipeline: download -> create dataset ->
@@ -140,19 +214,22 @@ func HandleInstallJob(ctx context.Context, job asyncjob.Job, reporter asyncjob.R
 	if err != nil {
 		return asyncjob.Result{}, err
 	}
-	if previous != nil && previous.DatasetID != "" {
-		cfg := decodeInstallConfig(previous)
-		if len(cfg.TaskIDs) > 0 || len(cfg.Failures) > 0 {
-			retryPayload, _ := json.Marshal(updateJobPayload{MarketItemID: payload.MarketItemID, UserID: payload.UserID, UserName: payload.UserName, Revision: payload.Revision, RetryOnly: true})
-			job.PayloadJSON = retryPayload
-			return HandleUpdateJob(ctx, job, reporter)
-		}
+	cfg := decodeInstallConfig(previous)
+	if previous != nil && previous.DatasetID != "" && payload.Prebuilt == nil && cfg.Prebuilt == nil && (len(cfg.TaskIDs) > 0 || len(cfg.Failures) > 0) {
+		retryPayload, _ := json.Marshal(updateJobPayload{MarketItemID: payload.MarketItemID, UserID: payload.UserID, UserName: payload.UserName, Revision: payload.Revision, RetryOnly: true})
+		job.PayloadJSON = retryPayload
+		return HandleUpdateJob(ctx, job, reporter)
 	}
-
 	var item orm.KnowledgeMarketItem
 	if err := db.WithContext(ctx).Where("id = ? AND status = ?", payload.MarketItemID, "published").Take(&item).Error; err != nil {
 		return asyncjob.Result{ErrorCode: "market_item_not_found"}, err
 	}
+	releaseURL := prebuiltReleaseURL(item)
+	if payload.Prebuilt != nil || cfg.Prebuilt != nil ||
+		(!payload.OriginalSource && releaseURL != "" && (previous == nil || previous.DatasetID == "")) {
+		return handlePrebuiltInstall(ctx, db, job, payload, item, releaseURL, previous, reporter)
+	}
+
 	packageURL := strings.TrimSpace(item.PackageURL)
 	if packageURL == "" {
 		return asyncjob.Result{ErrorCode: "package_url_missing"}, errors.New("knowledge base has no package url")
@@ -267,6 +344,10 @@ func decodeInstallPayload(raw json.RawMessage) (installJobPayload, error) {
 	payload.Revision = strings.TrimSpace(payload.Revision)
 	if payload.MarketItemID == "" || payload.UserID == "" {
 		return payload, errors.New("invalid install payload")
+	}
+	if payload.ProcessingLevel == doc.ProcessingLevelIndexed && (payload.OriginalSource || payload.Prebuilt == nil ||
+		payload.IndexConfirmation == nil || !payload.IndexConfirmation.valid()) {
+		return payload, errors.New("indexed install payload is missing its confirmed prebuilt release or model")
 	}
 	return payload, nil
 }

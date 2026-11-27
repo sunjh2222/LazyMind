@@ -115,7 +115,7 @@ func marketDisplay(job orm.AsyncJob, parse parseProgressInfo) string {
 	return "done"
 }
 
-func addMarketControl(r *http.Request, db *gorm.DB, data map[string]any, job orm.AsyncJob, parse parseProgressInfo) {
+func addMarketControl(r *http.Request, db *gorm.DB, data map[string]any, job orm.AsyncJob, install *orm.KnowledgeMarketInstall, parse parseProgressInfo, index *installIndexProgressView) {
 	state := marketDisplay(job, parse)
 	terminal := marketTaskTerminal(state)
 	worker := "unknown"
@@ -138,8 +138,18 @@ func addMarketControl(r *http.Request, db *gorm.DB, data map[string]any, job orm
 			canCancel = marketCancelHealth(r.Context()) == "available"
 		}
 	}
-	data["display_state"], data["can_cancel"], data["can_delete"] = state, canCancel, terminal
-	data["can_retry"] = terminal && latest && worker == "available" && (parse.Failed > 0 || job.Status == "failed")
+	data["display_state"], data["can_cancel"], data["can_delete"] = state, canCancel, terminal && !index.active()
+	retryable := terminal && (parse.Failed > 0 || job.Status == "failed")
+	if latest && worker == "available" && state == "unknown" {
+		_, retryable = recoverablePrebuiltRetry(r.Context(), db, job, install, parse)
+	}
+	data["can_retry"] = latest && worker == "available" && retryable
+	if index != nil {
+		data["index_progress"] = index.progress
+		if index.canRetry && parse.State == "done" {
+			data["can_retry"] = marketWorkerHealth(r.Context()) == "available"
+		}
+	}
 }
 
 func marketTaskTerminal(state string) bool {

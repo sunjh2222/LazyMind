@@ -2,7 +2,7 @@ import { act, cleanup, fireEvent, render, screen, within } from "@testing-librar
 import { ConfigProvider } from "antd";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import type { KnowledgeMarketTaskDetailOpenAPIResponse } from "@/api/generated/core-client";
+import type { InstallPreview } from "@/api/generated/core-client";
 
 import KnowledgePage from "./index";
 import * as marketApi from "@/modules/knowledge/api/knowledgeMarket";
@@ -22,6 +22,7 @@ vi.mock("@/modules/knowledge/api/knowledgeMarket", () => ({
   getKnowledgeMarketTask: vi.fn(),
   deleteKnowledgeMarketTask: vi.fn(),
   retryKnowledgeMarketTask: vi.fn(),
+  getKnowledgeMarketInstallPreview: vi.fn(),
   installKnowledgeMarketItem: vi.fn(),
   listKnowledgeMarket: vi.fn(),
   listKnowledgeMarketDomains: vi.fn(),
@@ -51,6 +52,7 @@ vi.mock("@/modules/knowledge/components/KnowledgeTag", () => ({ default: () => n
 vi.mock("@/components/auth", () => ({ AgentAppsAuth: { getUserInfo: () => ({}) } }));
 vi.mock("@/components/request", () => ({
   BASE_URL: "",
+  getLocalizedErrorMessage: () => "安装请求失败",
   axiosInstance: { get: vi.fn().mockResolvedValue({ data: { ready: true, items: [], total: 0, page: 1, page_size: 20, counts: {active: 0}, unfinished_count: 0 } }) },
 }));
 vi.mock("@/modules/knowledge/utils/request", () => ({
@@ -65,9 +67,9 @@ vi.mock("@/hooks/useModelFeatures", () => ({
   MODEL_FEATURES_CHANGED_EVENT: "features-changed",
 }));
 
-const jobs = new Map<string, KnowledgeMarketTaskDetailOpenAPIResponse>();
+const jobs = new Map<string, marketApi.KnowledgeMarketTaskDetail>();
 
-function task(id: string, overrides: Partial<KnowledgeMarketTaskDetailOpenAPIResponse> = {}) {
+function task(id: string, overrides: Partial<marketApi.KnowledgeMarketTaskDetail> = {}) {
   return {
     job_id: id,
     job_type: "knowledge_market_install",
@@ -91,9 +93,17 @@ function task(id: string, overrides: Partial<KnowledgeMarketTaskDetailOpenAPIRes
 }
 
 function unfinishedCount() {
-  return [...jobs.values()].filter((job) => job.display_state
+  return [...jobs.values()].filter((job) => ["waiting", "running"].includes(job.index_progress?.state || "") || (job.display_state
     ? ["pending", "processing", "blocked", "unknown"].includes(job.display_state)
-    : ["pending", "running"].includes(job.job_status) || (!["failed", "canceled"].includes(job.job_status) && !["done", "failed", "partial_failed"].includes(job.stage || "")) || (job.stage === "done" && (job.overall_percent || 0) < 100)).length;
+    : ["pending", "running"].includes(job.job_status) || (!["failed", "canceled"].includes(job.job_status) && !["done", "failed", "partial_failed"].includes(job.stage || "")) || (job.stage === "done" && (job.overall_percent || 0) < 100))).length;
+}
+
+function installPreview(vectorIndex: InstallPreview["vector_index"] = { available: false }): InstallPreview {
+  return { item_id: "install", version: "v1", manifest_sha256: "fixture-sha", document_count: 4, chunk_count: 21, size_bytes: 1536, vector_index: vectorIndex };
+}
+
+function marketHTTPError(status: number, data?: { reason: string }) {
+  return { isAxiosError: true, response: { status, data: { data } } };
 }
 
 function taskEntry(count: number) {
@@ -175,6 +185,7 @@ beforeEach(() => {
     return {items, page, page_size: 10, total: items.length, counts: {success: parse?.done || 0, failed: parse?.failed || 0, canceled: parse?.canceled || 0, unfinished: (parse?.pending || 0)+(parse?.parsing || 0)}, file_details_available: true};
   });
   vi.mocked(marketApi.getKnowledgeMarketTask).mockImplementation(async (jobId) => jobs.get(jobId)!);
+  vi.mocked(marketApi.getKnowledgeMarketInstallPreview).mockRejectedValue(marketHTTPError(404));
   vi.mocked(marketApi.installKnowledgeMarketItem).mockImplementation(async (id) => {
     jobs.set(id, task(id));
     return { job_id: id, state: "pending" };
@@ -195,6 +206,118 @@ afterEach(() => {
 });
 
 describe("knowledge market background tasks", () => {
+  it.each(["card", "detail"])("confirms a text-only install from the %s and never submits on cancel", async (entry) => {
+    vi.mocked(marketApi.getKnowledgeMarketInstallPreview).mockResolvedValue(installPreview());
+    await mountPage();
+    await click(screen.getByRole("button", { name: /知识广场/ }));
+    const card = screen.getByRole("button", { name: "查看知识库 install详情" });
+    const open = async () => {
+      if (entry === "detail") {
+        await click(card);
+        await click(within(screen.getByRole("dialog", { name: "知识库 install" })).getByRole("button", { name: "安装" }));
+        await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+        expect(screen.queryByRole("dialog", { name: "知识库 install" })).not.toBeInTheDocument();
+      } else {
+        await click(within(card).getByRole("button", { name: "安装" }));
+      }
+      return within(screen.getByRole("dialog", { name: "安装 知识库 install" }));
+    };
+    const dialog = await open();
+    expect(dialog.getByRole("radio", { name: "仅安装文本切片" })).toBeChecked();
+    expect(dialog.getByRole("radio", { name: "安装并启用向量检索" })).toBeDisabled();
+    expect(dialog.getByText("文档数")).toBeInTheDocument();
+    expect(dialog.getByText("21")).toBeInTheDocument();
+    expect(dialog.getByText("1.5 KB")).toBeInTheDocument();
+    await click(dialog.getByRole("button", { name: "取消" }));
+    expect(marketApi.installKnowledgeMarketItem).not.toHaveBeenCalled();
+
+    const reopened = await open();
+    await click(reopened.getByRole("button", { name: "安装" }));
+    expect(vi.mocked(marketApi.installKnowledgeMarketItem).mock.calls).toEqual([["install", { processing_level: "chunked" }, { silentError: true }]]);
+    expect(screen.getByText("已加入后台任务")).toBeInTheDocument();
+  });
+
+  it("refreshes a stale vector confirmation and waits for explicit confirmation again", async () => {
+    vi.mocked(marketApi.getKnowledgeMarketInstallPreview)
+      .mockResolvedValueOnce(installPreview({ available: true, model_name: "向量模型 A", confirmation_token: "token-a" }))
+      .mockResolvedValueOnce({ ...installPreview({ available: true, model_name: "向量模型 B", confirmation_token: "token-b" }), version: "v2" });
+    vi.mocked(marketApi.installKnowledgeMarketItem)
+      .mockRejectedValueOnce(marketHTTPError(409, { reason: "install_confirmation_stale" }));
+    await mountPage();
+    await click(screen.getByRole("button", { name: /知识广场/ }));
+    await click(screen.getByRole("button", { name: "安装" }));
+    const dialog = within(screen.getByRole("dialog", { name: "安装 知识库 install" }));
+    await click(dialog.getByRole("radio", { name: "安装并启用向量检索" }));
+    expect(dialog.getByText(/向量模型 A/)).toBeInTheDocument();
+    expect(dialog.getByText(/可能产生费用/)).toBeInTheDocument();
+    await click(dialog.getByRole("button", { name: "安装" }));
+    expect(marketApi.getKnowledgeMarketInstallPreview).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(marketApi.installKnowledgeMarketItem).mock.calls).toEqual([["install", { processing_level: "indexed", confirmation_token: "token-a" }, { silentError: true }]]);
+    expect(dialog.getByText(/重新确认/)).toBeInTheDocument();
+    expect(dialog.getByText("v2")).toBeInTheDocument();
+    expect(dialog.getByText(/向量模型 B/)).toBeInTheDocument();
+
+    await click(dialog.getByRole("button", { name: "安装" }));
+    expect(marketApi.installKnowledgeMarketItem).toHaveBeenNthCalledWith(2, "install", { processing_level: "indexed", confirmation_token: "token-b" }, { silentError: true });
+    expect(screen.getByText("已加入后台任务")).toBeInTheDocument();
+  });
+
+  it("shows index failure independently and refreshes a recovered receipt without a retry notification", async () => {
+    const indexed = task("indexed", {
+      job_status: "succeeded", stage: "done", display_state: "done", overall_percent: 100, dataset_id: "reading-library",
+      index_progress: { state: "running", total: 2, done: 1, failed: 0, pending: 1, unknown: 0 },
+    });
+    jobs.set(indexed.job_id, indexed);
+    await mountPage();
+    await click(taskEntry(1));
+    const dialog = within(screen.getByRole("dialog", { name: "后台任务" }));
+    expect(dialog.getByRole("link", { name: indexed.name })).toHaveAttribute("href", "/lib/knowledge/detail/reading-library");
+    expect(dialog.getByText("文本安装")).toBeInTheDocument();
+    expect(dialog.getByText("100%")).toBeInTheDocument();
+    expect(dialog.getByText("正在建立索引")).toBeInTheDocument();
+    expect(dialog.getByText("已索引 1/2 篇")).toBeInTheDocument();
+
+    jobs.set(indexed.job_id, { ...indexed, can_retry: true, index_progress: { ...indexed.index_progress!, state: "partial_failed", failed: 1, pending: 0 } });
+    await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+    expect(dialog.getByText("部分索引失败")).toBeInTheDocument();
+    expect(dialog.getByRole("link", { name: indexed.name })).toBeInTheDocument();
+    vi.mocked(marketApi.retryKnowledgeMarketTask).mockResolvedValue({ job_id: indexed.job_id, state: "succeeded" });
+    await click(dialog.getByRole("button", { name: "重试" }));
+    expect(vi.mocked(marketApi.retryKnowledgeMarketTask).mock.calls).toEqual([[indexed.job_id]]);
+    expect(screen.queryByText("已加入后台任务")).not.toBeInTheDocument();
+  });
+
+  it.each([true, false])("follows the public installation for an indexing retry (parent returned: %s)", async (parentReturned) => {
+    for (let i = 0; i < 10; i += 1) {
+      jobs.set(`recent-${i}`, task(`recent-${i}`, { job_status: "succeeded", display_state: "done" }));
+    }
+    const index = { state: "unknown" as const, total: 2, done: 1, failed: 0, pending: 0, unknown: 1 };
+    const parent = task("original-install", {
+      job_status: "succeeded", stage: "done", display_state: "done", overall_percent: 100,
+      parse: { state: "done", total: 2, done: 2, failed: 0, pending: 0, parsing: 0 },
+      index_progress: index, can_retry: true, created_at: "2026-09-01T08:00:00Z",
+    });
+    jobs.set(parent.job_id, parent);
+    vi.mocked(marketApi.retryKnowledgeMarketTask).mockImplementation(async () => {
+      jobs.set(parent.job_id, { ...parent, can_retry: false, index_progress: { ...index, state: "running", pending: 1, unknown: 0 } });
+      return { job_id: "internal-index-dispatch", state: "pending", ...(parentReturned ? { parent_job_id: parent.job_id } : {}) };
+    });
+
+    await mountPage();
+    await click(taskEntry(0));
+    const dialog = within(screen.getByRole("dialog", { name: "后台任务" }));
+    await click(dialog.getByRole("button", { name: "任务下一页" }));
+    expect(dialog.getByText("索引状态待确认")).toBeInTheDocument();
+    await click(dialog.getByRole("button", { name: "重试" }));
+
+    expect(vi.mocked(marketApi.retryKnowledgeMarketTask).mock.calls).toEqual([[parent.job_id]]);
+    expect(dialog.getByRole("button", { name: `收起任务详情 ${parent.name}` })).toHaveAttribute("aria-expanded", "true");
+    expect(dialog.getByText("正在建立索引")).toBeInTheDocument();
+    expect(screen.getByText(`${parent.name} 的索引重试已提交。`)).toBeInTheDocument();
+    expect(marketApi.listKnowledgeMarketTaskFiles).toHaveBeenCalledWith(parent.job_id, "success", 1, expect.anything());
+    expect(vi.mocked(marketApi.getKnowledgeMarketTask).mock.calls.every(([id]) => id !== "internal-index-dispatch")).toBe(true);
+  });
+
   it("keeps cached dataset names unlinked until the opened dialog gets its own response", async () => {
     const cached = task("cached", { dataset_id: "ds-old" });
     jobs.set("cached", cached);
@@ -439,6 +562,7 @@ describe("knowledge market background tasks", () => {
     expect(taskEntry(0).querySelector(".ant-badge-count")).toBeNull();
     await click(screen.getByRole("button", { name: /知识广场/ }));
     await click(screen.getByRole("button", { name: "安装" }));
+    expect(vi.mocked(marketApi.installKnowledgeMarketItem).mock.calls).toEqual([["install"]]);
     expect(taskEntry(1).querySelector(".ant-badge")).toHaveTextContent("1");
     expect(screen.getByText("已加入后台任务").closest(".ant-notification-bottomRight")).not.toBeNull();
     expect(document.querySelector(".ant-message-notice")).toBeNull();

@@ -970,6 +970,8 @@ func registerAllRoutes(r *mux.Router) {
 	handleAPI(r, "GET", "/knowledge-market", []string{"qa.read"}, knowledge_market.MarketList)
 	handleAPI(r, "GET", "/knowledge-market/domains", []string{"qa.read"}, knowledge_market.MarketDomains)
 	handleAPI(r, "GET", "/knowledge-market/items/{market_item_id}", []string{"qa.read"}, knowledge_market.MarketGet)
+	handleAPI(r, "GET", "/knowledge-market/items/{market_item_id}/install-preview", []string{"qa.read"}, knowledge_market.MarketInstallPreview)
+	handleAPI(r, "GET", "/knowledge-market/items/{market_item_id}/update-preview", []string{"qa.read"}, knowledge_market.MarketPrebuiltUpdatePreview)
 	handleAPI(r, "POST", "/knowledge-market/items/{market_item_id}:install", []string{"qa.write"}, systemdeps.RequireRAG(knowledge_market.MarketInstall))
 	handleAPI(r, "POST", "/knowledge-market/items/{market_item_id}:update", []string{"qa.write"}, systemdeps.RequireRAG(knowledge_market.MarketUpdate))
 	handleAPI(r, "POST", "/knowledge-market:update-all", []string{"qa.write"}, systemdeps.RequireRAG(knowledge_market.MarketUpdateAll))

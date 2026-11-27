@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import type { KnowledgeMarketTaskListOpenAPIResponse } from "@/api/generated/core-client";
-import { listKnowledgeMarketTaskPage } from "@/modules/knowledge/api/knowledgeMarket";
+import { listKnowledgeMarketTaskPage, type KnowledgeMarketTaskList } from "@/modules/knowledge/api/knowledgeMarket";
 
 // The entry badge and the open dialog consume the same server snapshot.
 export function useKnowledgeMarketTasks(open: boolean, refreshKey: string) {
@@ -8,7 +7,7 @@ export function useKnowledgeMarketTasks(open: boolean, refreshKey: string) {
   const [revision, setRevision] = useState(0);
   // A reopened dialog must validate its cached rows before enabling navigation.
   const scope = useMemo(() => ({ open, page, refreshKey, revision }), [open, page, refreshKey, revision]);
-  const [snapshot, setSnapshot] = useState<{ scope: typeof scope; data: KnowledgeMarketTaskListOpenAPIResponse }>();
+  const [snapshot, setSnapshot] = useState<{ scope: typeof scope; data: KnowledgeMarketTaskList }>();
   const [loading, setLoading] = useState(false);
   const [queryFailed, setQueryFailed] = useState(false);
   const refresh = useCallback(() => setRevision((value) => value + 1), []);

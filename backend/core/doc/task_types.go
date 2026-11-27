@@ -292,34 +292,41 @@ type transferBinding struct {
 }
 
 type taskExt struct {
-	ProcessingLevel      string            `json:"processing_level,omitempty"`
-	ProcessingRevision   int64             `json:"processing_revision,omitempty"`
-	MarketPreviousTaskID string            `json:"market_previous_task_id,omitempty"`
-	MarketSubmission     string            `json:"market_submission,omitempty"`
-	TaskType             string            `json:"task_type,omitempty"`
-	TaskState            string            `json:"task_state,omitempty"`
-	ErrorMessage         string            `json:"error_message,omitempty"`
-	DocumentPID          string            `json:"document_pid,omitempty"`
-	DisplayName          string            `json:"display_name,omitempty"`
-	TargetDatasetID      string            `json:"target_dataset_id,omitempty"`
-	TargetPID            string            `json:"target_pid,omitempty"`
-	TargetPath           string            `json:"target_path,omitempty"`
-	DataSourceType       string            `json:"data_source_type,omitempty"`
-	Files                []TaskFile        `json:"files,omitempty"`
-	DocumentTags         []string          `json:"document_tags,omitempty"`
-	ReparseGroups        []string          `json:"reparse_groups,omitempty"`
-	ReparseMode          string            `json:"reparse_mode,omitempty"`
-	TransferBindings     []transferBinding `json:"transfer_bindings,omitempty"`
+	ProcessingLevel      string                 `json:"processing_level,omitempty"`
+	ProcessingRevision   int64                  `json:"processing_revision,omitempty"`
+	MarketPreviousTaskID string                 `json:"market_previous_task_id,omitempty"`
+	MarketRetryAttempt   string                 `json:"market_retry_attempt,omitempty"`
+	MarketSubmission     string                 `json:"market_submission,omitempty"`
+	MarketIndexOrigin    *marketIndexTaskOrigin `json:"market_index_origin,omitempty"`
+	MarketIndexBatch     *marketIndexBatch      `json:"market_index_batch,omitempty"`
+	TaskType             string                 `json:"task_type,omitempty"`
+	TaskState            string                 `json:"task_state,omitempty"`
+	ErrorMessage         string                 `json:"error_message,omitempty"`
+	DocumentPID          string                 `json:"document_pid,omitempty"`
+	DisplayName          string                 `json:"display_name,omitempty"`
+	TargetDatasetID      string                 `json:"target_dataset_id,omitempty"`
+	TargetPID            string                 `json:"target_pid,omitempty"`
+	TargetPath           string                 `json:"target_path,omitempty"`
+	DataSourceType       string                 `json:"data_source_type,omitempty"`
+	Files                []TaskFile             `json:"files,omitempty"`
+	DocumentTags         []string               `json:"document_tags,omitempty"`
+	ReparseGroups        []string               `json:"reparse_groups,omitempty"`
+	ReparseMode          string                 `json:"reparse_mode,omitempty"`
+	TransferBindings     []transferBinding      `json:"transfer_bindings,omitempty"`
 }
 
 type documentExt struct {
-	StoredPath       string   `json:"stored_path,omitempty"`
-	StoredName       string   `json:"stored_name,omitempty"`
-	OriginalFilename string   `json:"original_filename,omitempty"`
-	FileSize         int64    `json:"file_size,omitempty"`
-	ContentType      string   `json:"content_type,omitempty"`
-	RelativePath     string   `json:"relative_path,omitempty"`
-	Tags             []string `json:"tags,omitempty"`
+	StoredPath         string   `json:"stored_path,omitempty"`
+	StoredName         string   `json:"stored_name,omitempty"`
+	OriginalFilename   string   `json:"original_filename,omitempty"`
+	FileSize           int64    `json:"file_size,omitempty"`
+	ContentType        string   `json:"content_type,omitempty"`
+	RelativePath       string   `json:"relative_path,omitempty"`
+	Tags               []string `json:"tags,omitempty"`
+	PrebuiltPath       string   `json:"prebuilt_path,omitempty"`
+	PrebuiltSourcePath string   `json:"prebuilt_source_path,omitempty"`
+	PrebuiltSourceURL  string   `json:"prebuilt_source_url,omitempty"`
+	PrebuiltVersioned  bool     `json:"prebuilt_versioned,omitempty"`
 	// text（text，Defaulttext stored_path text）
 	SourceStoredPath string `json:"source_stored_path,omitempty"`
 	// text（Office Successtext PDF）

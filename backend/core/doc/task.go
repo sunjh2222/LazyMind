@@ -1414,6 +1414,7 @@ func startTasksInternal(r *http.Request, datasetID string, taskIDs []string) ([]
 	var dataset orm.Dataset
 	_ = store.DB().WithContext(r.Context()).Where("id = ? AND deleted_at IS NULL", datasetID).Take(&dataset).Error
 	storeOnly := effectiveProcessingLevel(dataset.ProcessingLevel) == ProcessingLevelStored
+	prebuiltMarket := isPrebuiltMarketDataset(dataset)
 	// Page uploads finish via tasks:start. Their initial parse task is import
 	// bookkeeping, not explicit paper preparation; the bounded scheduler owns it.
 	storeOriginalOnly := storeOnly || dataset.Scene == "academic_papers"
@@ -1445,6 +1446,11 @@ func startTasksInternal(r *http.Request, datasetID string, taskIDs []string) ([]
 		switch TaskType(strings.TrimSpace(taskRow.TaskType)) {
 		case TaskTypeParse, TaskTypeParseUploaded:
 			if !storeOriginalOnly && !systemdeps.PythonComponentActive("rag") {
+				if prebuiltMarket {
+					resultsByTaskID[taskID] = StartTaskResult{TaskID: taskID, DocumentID: taskRow.DocID, DisplayName: taskRow.DisplayName,
+						Status: "FAILED", SubmitStatus: "REJECTED", Message: "RAG component is required to import prebuilt text"}
+					continue
+				}
 				result := StartTaskResult{TaskID: taskID, DocumentID: taskRow.DocID, DisplayName: taskRow.DisplayName,
 					Status: "STARTED", SubmitStatus: "ACCEPTED", Message: "native parsing and chunks saved; vector indexing deferred"}
 				if err := prepareBaseDocument(r, datasetID, taskRow); err != nil {
@@ -1624,20 +1630,25 @@ func startParseTasksAtLevel(ctx context.Context, userID, datasetID string, taskI
 	if strings.TrimSpace(requestedLevel) != "" {
 		processingLevel = effectiveProcessingLevel(requestedLevel)
 	}
-	llmConfig, err := loadParsingLLMConfig(ctx, store.DB(), userID, processingLevel)
-	if errors.Is(err, errEmbeddingStateChanged) {
-		return nil, err
-	}
-	if validationErr := validateParsingLLMConfig(ctx, store.DB(), userID, processingLevel, llmConfig, err); validationErr != nil {
-		return nil, validationErr
-	}
-	if err != nil {
-		log.Printf("[startParseTasksInternal] failed to load llm_config for user=%s: %v", userID, err)
-	}
-	llmConfig = normalizeParsingLLMConfig(llmConfig)
-	ocrConfig, err := loadIngestionParser(ctx, userID)
-	if err != nil {
-		return nil, err
+	prebuiltMarket := isPrebuiltMarketDataset(dataset) && processingLevel == ProcessingLevelChunked
+	var llmConfig, ocrConfig map[string]any
+	if !prebuiltMarket {
+		var err error
+		llmConfig, err = loadParsingLLMConfig(ctx, store.DB(), userID, processingLevel)
+		if errors.Is(err, errEmbeddingStateChanged) {
+			return nil, err
+		}
+		if validationErr := validateParsingLLMConfig(ctx, store.DB(), userID, processingLevel, llmConfig, err); validationErr != nil {
+			return nil, validationErr
+		}
+		if err != nil {
+			log.Printf("[startParseTasksInternal] failed to load llm_config for user=%s: %v", userID, err)
+		}
+		llmConfig = normalizeParsingLLMConfig(llmConfig)
+		ocrConfig, err = loadIngestionParser(ctx, userID)
+		if err != nil {
+			return nil, err
+		}
 	}
 	parseProfile := resolveDocumentParseProfile()
 	applog.Logger.Info().
@@ -1680,7 +1691,14 @@ func startParseTasksAtLevel(ctx context.Context, userID, datasetID string, taskI
 		submittedExt.ProcessingLevel = processingLevel
 		submittedExt.ProcessingRevision = dataset.ProcessingRevision
 		taskRow.Ext = mustJSON(submittedExt)
-		bindNativeIndexTask(ctx, datasetID, docRow.ID, taskRow.ID, processingLevel, llmConfig["_embedding_generation"].(int64))
+		if prebuiltMarket {
+			if dExt.PrebuiltPath == "" {
+				resultsByTaskID[taskID] = StartTaskResult{TaskID: taskID, DocumentID: docRow.ID, DisplayName: docRow.DisplayName, Status: "FAILED", SubmitStatus: "REJECTED", Message: "prebuilt text object is missing"}
+				continue
+			}
+		} else {
+			bindNativeIndexTask(ctx, datasetID, docRow.ID, taskRow.ID, processingLevel, llmConfig["_embedding_generation"].(int64))
+		}
 		if normalizeSpreadsheetDirectParse(&dExt) || normalizeLocalOfficeDirectParse(&dExt, parseProfile) {
 			persistDocumentConvertState(ctx, datasetID, docRow.ID, dExt)
 		}
@@ -1728,7 +1746,11 @@ func startParseTasksAtLevel(ctx context.Context, userID, datasetID string, taskI
 			items = append(items, buildAddFileItem(datasetID, candidate.task, candidate.doc, candidate.docExt, parsePath))
 		}
 		if len(baseTasks) > 0 {
-			extResults, err := callExternalAddDocsContext(ctx, addRequest{Items: items, KbID: kbID, SourceType: "EXTERNAL", IdempotencyKey: parseSubmissionKey(datasetID, baseTasks), ModelConfig: llmConfig, OCRConfig: ocrConfig, ProcessingLevel: processingLevel})
+			submissionScope := datasetID
+			if attempt, _ := ctx.Value(prebuiltRetryAttemptKey{}).(string); prebuiltMarket && attempt != "" {
+				submissionScope += ":" + attempt
+			}
+			extResults, err := callExternalAddDocsContext(ctx, addRequest{Items: items, KbID: kbID, SourceType: "EXTERNAL", IdempotencyKey: parseSubmissionKey(submissionScope, baseTasks), ModelConfig: llmConfig, OCRConfig: ocrConfig, ProcessingLevel: processingLevel})
 			if err != nil {
 				for i, taskRow := range baseTasks {
 					resolved := common.ResolveAppError(err.Error(), http.StatusBadGateway)
@@ -3054,32 +3076,11 @@ func startReparseTasksInternalAtLevel(r *http.Request, datasetID string, taskIDs
 	}
 	now := time.Now().UTC()
 	for i, taskRow := range taskRows {
-		var ext taskExt
-		_ = json.Unmarshal(taskRow.Ext, &ext)
-		ext.TaskState = string(TaskStateRunning)
-		ext.ProcessingRevision = dataset.ProcessingRevision
-		ext.ErrorMessage = ""
 		lazyllmTaskID := ""
-		ext.ProcessingLevel = processingLevel
 		if i < len(lazyllmTaskIDs) {
 			lazyllmTaskID = strings.TrimSpace(lazyllmTaskIDs[i])
 		}
-		updates := map[string]any{"ext": mustJSON(ext), "updated_at": now}
-		if lazyllmTaskID != "" {
-			updates["lazyllm_task_id"] = lazyllmTaskID
-		}
-		publishErr := store.DB().WithContext(r.Context()).Transaction(func(tx *gorm.DB) error {
-			if err := validateTaskPublication(tx, datasetID, taskRow, docRows[i]); err != nil {
-				return err
-			}
-			if err := tx.Model(&orm.Task{}).Where("id = ? AND dataset_id = ? AND deleted_at IS NULL", taskRow.ID, datasetID).Updates(updates).Error; err != nil {
-				return err
-			}
-			if err := tx.Model(&orm.Document{}).Where("id = ? AND dataset_id = ? AND deleted_at IS NULL", docRows[i].ID, datasetID).Update("updated_at", now).Error; err != nil {
-				return err
-			}
-			return nil
-		})
+		publishErr := publishReparseSubmission(r.Context(), store.DB(), dataset, taskRow, docRows[i], processingLevel, lazyllmTaskID, now)
 		if publishErr != nil {
 			results = append(results, StartTaskResult{TaskID: taskRow.ID, DocumentID: docRows[i].ID, DisplayName: docRows[i].DisplayName, Status: "FAILED", SubmitStatus: "REJECTED", Message: publishErr.Error()})
 			continue
@@ -3093,6 +3094,29 @@ func startReparseTasksInternalAtLevel(r *http.Request, datasetID string, taskIDs
 		Strs("ng_names", ngNames).
 		Msg("reparse tasks submitted")
 	return results, nil
+}
+
+func publishReparseSubmission(ctx context.Context, db *gorm.DB, dataset orm.Dataset, taskRow orm.Task,
+	document orm.Document, processingLevel, lazyllmTaskID string, now time.Time) error {
+	var ext taskExt
+	_ = json.Unmarshal(taskRow.Ext, &ext)
+	ext.TaskState = string(TaskStateRunning)
+	ext.ProcessingRevision = dataset.ProcessingRevision
+	ext.ErrorMessage = ""
+	ext.ProcessingLevel = processingLevel
+	updates := map[string]any{"ext": mustJSON(ext), "updated_at": now}
+	if lazyllmTaskID != "" {
+		updates["lazyllm_task_id"] = lazyllmTaskID
+	}
+	return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := validateTaskPublication(tx, dataset.ID, taskRow, document); err != nil {
+			return err
+		}
+		if err := tx.Model(&orm.Task{}).Where("id = ? AND dataset_id = ? AND deleted_at IS NULL", taskRow.ID, dataset.ID).Updates(updates).Error; err != nil {
+			return err
+		}
+		return tx.Model(&orm.Document{}).Where("id = ? AND dataset_id = ? AND deleted_at IS NULL", document.ID, dataset.ID).Update("updated_at", now).Error
+	})
 }
 
 func shouldSubmitReparseToLazyLLM(processingLevel string) bool {

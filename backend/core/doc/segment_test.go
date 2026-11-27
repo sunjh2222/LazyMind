@@ -83,6 +83,31 @@ func TestMapChunkToSegmentFallsBackToSourcePath(t *testing.T) {
 	}
 }
 
+func TestMapChunkToSegmentKeepsPrebuiltTextWithSourcePath(t *testing.T) {
+	const sourcePath = "reading-room.md"
+	const content = "周六阅览场在下午 14:30 开始。"
+	for _, group := range []string{"block", "line"} {
+		t.Run(group, func(t *testing.T) {
+			seg := mapChunkToSegment("dataset-1", "doc-1", map[string]any{
+				"uid":     "chunk-1",
+				"type":    float64(1),
+				"group":   group,
+				"content": content,
+				"metadata": map[string]any{
+					"source_path": sourcePath,
+				},
+			})
+
+			if seg.DisplayContent != content || len(seg.ImageKeys) != 0 {
+				t.Fatalf("wanted text with no generated image, got %q and image keys %#v", seg.DisplayContent, seg.ImageKeys)
+			}
+			if seg.Content != content || seg.Text != content || seg.Metadata["source_path"] != sourcePath {
+				t.Fatalf("original text or source metadata changed: %#v", seg)
+			}
+		})
+	}
+}
+
 func TestRefreshStaticFileURL(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("LAZYMIND_UPLOAD_ROOT", root)

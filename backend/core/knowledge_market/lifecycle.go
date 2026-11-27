@@ -19,6 +19,7 @@ import (
 
 var errMarketBusy = doc.ErrMarketProcessing
 var errMarketNotInstalled = errors.New("knowledge base is not installed")
+var errMarketSourceChanged = errors.New("knowledge base source changed; retry installation")
 
 func parseIsActive(p parseProgressInfo) bool {
 	return p.Total > 0 && (p.State == "pending" || p.State == "parsing" || p.State == "unknown")
@@ -109,6 +110,14 @@ func repairMarketImport(ctx context.Context, db *gorm.DB, install *orm.Knowledge
 // Serialize item actions and freeze terminal history before any worker changes
 // the shared dataset. ResultJSON carries the snapshot; no schema migration.
 func enqueueMarketItem(ctx context.Context, db *gorm.DB, req asyncjob.EnqueueRequest, parentJobID string) (*orm.AsyncJob, error) {
+	return enqueueMarketItemWithReplay(ctx, db, req, parentJobID, "")
+}
+
+func hasPrebuiltUpdatePins(payload updateJobPayload) bool {
+	return payload.PrebuiltFrom != nil || payload.PrebuiltTarget != nil || payload.PrebuiltDatasetID != ""
+}
+
+func enqueueMarketItemWithReplay(ctx context.Context, db *gorm.DB, req asyncjob.EnqueueRequest, parentJobID, predecessorID string) (*orm.AsyncJob, error) {
 	var job *orm.AsyncJob
 	err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var item orm.KnowledgeMarketItem
@@ -124,18 +133,89 @@ func enqueueMarketItem(ctx context.Context, db *gorm.DB, req asyncjob.EnqueueReq
 		if req.JobType == updateJobType && (install == nil || install.DatasetID == "") {
 			return errMarketNotInstalled
 		}
+		if req.JobType == updateJobType {
+			payload, _ := req.Payload.(updateJobPayload)
+			installed := decodeInstallConfig(install).Prebuilt
+			if hasPrebuiltUpdatePins(payload) {
+				if item.Status != "published" {
+					return gorm.ErrRecordNotFound
+				}
+				if installed == nil || payload.PrebuiltFrom == nil || payload.PrebuiltTarget == nil ||
+					install.DatasetID != payload.PrebuiltDatasetID || *installed != *payload.PrebuiltFrom ||
+					payload.PrebuiltFrom.URL != payload.PrebuiltTarget.URL || prebuiltReleaseURL(item) != payload.PrebuiltTarget.URL {
+					return errMarketSourceChanged
+				}
+			} else if installed != nil {
+				return errMarketSourceChanged
+			}
+		}
+		if payload, ok := req.Payload.(installJobPayload); ok {
+			cfg := decodeInstallConfig(install)
+			switch {
+			case payload.OriginalSource && cfg.Prebuilt != nil:
+				return errMarketSourceChanged
+			case payload.Prebuilt != nil && cfg.Prebuilt != nil && *payload.Prebuilt != *cfg.Prebuilt:
+				return errMarketSourceChanged
+			case payload.Prebuilt != nil && cfg.Prebuilt == nil &&
+				((install != nil && install.DatasetID != "") || prebuiltReleaseURL(item) != payload.Prebuilt.URL):
+				return errMarketSourceChanged
+			}
+			if item.Status != "published" {
+				return gorm.ErrRecordNotFound
+			}
+		}
 		var active int64
-		if err := tx.Model(&orm.AsyncJob{}).Where("create_user_id = ? AND (status IN ? OR (status = 'canceled' AND lock_until > ?)) AND id <> ? AND ((job_type IN ? AND resource_id = ?) OR job_type = ?)", req.CreateUserID, []string{"pending", "running"}, time.Now().UTC(), parentJobID, []string{installJobType, updateJobType}, req.ResourceID, updateAllJobType).Count(&active).Error; err != nil {
+		if err := tx.Model(&orm.AsyncJob{}).Where("create_user_id = ? AND (status IN ? OR (status = 'canceled' AND lock_until > ?)) AND id <> ? AND ((job_type IN ? AND resource_id = ?) OR job_type = ?)", req.CreateUserID, []string{"pending", "running"}, time.Now().UTC(), parentJobID, []string{installJobType, updateJobType, doc.MarketIndexJobType}, req.ResourceID, updateAllJobType).Count(&active).Error; err != nil {
 			return err
 		}
 		if active > 0 {
 			return errMarketBusy
 		}
-		if err := doc.SnapshotMarketTaskHistory(ctx, tx, install); err != nil {
-			return err
+		if predecessorID != "" {
+			// Recheck under the market/install locks. Another request can have
+			// started a newer job since the HTTP handler checked eligibility.
+			var predecessor orm.AsyncJob
+			if err := tx.Where("id = ? AND resource_id = ? AND create_user_id = ?", predecessorID, req.ResourceID, req.CreateUserID).
+				Take(&predecessor).Error; err != nil {
+				return err
+			}
+			if !marketLatest(ctx, tx, predecessor) {
+				return errMarketBusy
+			}
+			if req.JobType == updateJobType {
+				if predecessor.JobType != updateJobType || predecessor.Status != string(asyncjob.StatusFailed) {
+					return errMarketBusy
+				}
+			} else {
+				parse := parseProgress((&http.Request{}).WithContext(ctx), tx, install)
+				replay, ok := recoverablePrebuiltRetry(ctx, tx, predecessor, install, parse)
+				if !ok {
+					return errMarketBusy
+				}
+				req.Payload = replay
+				if err := doc.SnapshotPrebuiltReplayHistory(ctx, tx, install, predecessorID); err != nil {
+					return err
+				}
+			}
+		}
+		if predecessorID == "" || req.JobType == updateJobType {
+			if err := doc.SnapshotMarketTaskHistory(ctx, tx, install); err != nil {
+				return err
+			}
 		}
 		if err := tx.Model(&orm.AsyncJob{}).Where("job_type = ? AND idempotency_key = ? AND create_user_id = ? AND status IN ?", req.JobType, req.IdempotencyKey, req.CreateUserID, []string{"succeeded", "failed", "canceled"}).Update("idempotency_key", gorm.Expr("? || id", "kb_history:")).Error; err != nil {
 			return err
+		}
+		if payload, ok := req.Payload.(installJobPayload); ok && !payload.indexConfirmationExpiresAt.IsZero() {
+			if payload.Prebuilt == nil || payload.Prebuilt.URL != prebuiltReleaseURL(item) {
+				return errStaleInstallConfirmation
+			}
+			if err := lockInstallIndexConfirmation(tx, payload.IndexConfirmation); err != nil {
+				return err
+			}
+			if !time.Now().Before(payload.indexConfirmationExpiresAt) {
+				return errStaleInstallConfirmation
+			}
 		}
 		job, err = asyncjob.EnqueueInTransaction(ctx, tx, req)
 		return err
@@ -196,7 +276,7 @@ func loadActionTask(w http.ResponseWriter, r *http.Request, db *gorm.DB) (*orm.A
 		return nil, nil, parseProgressInfo{}, false
 	}
 	_, parse := taskProgress(r, db, job, install)
-	if job.Status == "pending" || job.Status == "running" || marketDraining(job) || parseIsActive(parse) {
+	if job.Status == "pending" || job.Status == "running" || marketDraining(job) {
 		common.ReplyAppErr(w, common.NewAppError(http.StatusConflict, common.ErrCodeConflict, "Task is still processing"))
 		return nil, nil, parseProgressInfo{}, false
 	}
@@ -208,11 +288,25 @@ func MarketDeleteTask(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	job, _, _, ok := loadActionTask(w, r, db)
+	job, _, parse, ok := loadActionTask(w, r, db)
 	if !ok {
 		return
 	}
-	if err := db.WithContext(r.Context()).Where("id = ? AND create_user_id = ? AND status NOT IN ?", job.ID, common.UserID(r), []string{"pending", "running"}).Delete(&orm.AsyncJob{}).Error; err != nil {
+	if parseIsActive(parse) {
+		common.ReplyAppErr(w, common.NewAppError(http.StatusConflict, common.ErrCodeConflict, "Task is still processing"))
+		return
+	}
+	err := db.WithContext(r.Context()).Transaction(func(tx *gorm.DB) error {
+		result := tx.Where("id = ? AND create_user_id = ? AND status = ?", job.ID, common.UserID(r), job.Status).Delete(&orm.AsyncJob{})
+		if result.Error != nil || result.RowsAffected == 0 || job.JobType != installJobType || job.Status == string(asyncjob.StatusSucceeded) {
+			return result.Error
+		}
+		// An aborted install cannot become eligible when its history is removed.
+		return tx.Model(&orm.AsyncJob{}).Where("job_type = ? AND idempotency_key = ? AND create_user_id = ? AND status IN ?",
+			doc.MarketIndexJobType, prebuiltIndexJobKey(job.ID), job.CreateUserID, []string{"pending", "running"}).
+			Updates(map[string]any{"status": asyncjob.StatusCanceled, "finished_at": time.Now().UTC()}).Error
+	})
+	if err != nil {
 		replyServiceError(w, err)
 		return
 	}
@@ -228,7 +322,23 @@ func MarketRetryTask(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	var original installJobPayload
+	predecessorID := ""
+	if parseIsActive(parse) {
+		var recoverable bool
+		original, recoverable = recoverablePrebuiltRetry(r.Context(), db, *job, install, parse)
+		if !recoverable {
+			common.ReplyAppErr(w, common.NewAppError(http.StatusConflict, common.ErrCodeConflict, "Task is still processing"))
+			return
+		}
+		predecessorID = job.ID
+	}
 	if install != nil && install.DatasetID != "" && !doc.RequireMarketDatasetPermission(w, r, install.DatasetID) {
+		return
+	}
+	if job.JobType == installJobType && job.Status == string(asyncjob.StatusSucceeded) && parse.State == "done" &&
+		decodeInstallConfig(install).IndexDispatchJobID != "" {
+		retryFailedPrebuiltIndex(w, r, db, *job, install)
 		return
 	}
 	if marketWorkerHealth(r.Context()) != "available" {
@@ -253,20 +363,39 @@ func MarketRetryTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jobType := job.JobType
-	var original installJobPayload
-	_ = json.Unmarshal(job.PayloadJSON, &original)
-	var payload any = installJobPayload{MarketItemID: job.ResourceID, UserID: common.UserID(r), UserName: common.UserName(r), Revision: original.Revision}
-	if job.JobType == updateJobType || ((job.Status == "succeeded" || job.Status == "canceled") && install != nil && install.DatasetID != "") {
+	var payload any
+	if job.JobType == updateJobType || ((job.Status == "succeeded" || job.Status == "canceled") && install != nil && install.DatasetID != "" && decodeInstallConfig(install).Prebuilt == nil) {
 		jobType = updateJobType
 		var update updateJobPayload
 		_ = json.Unmarshal(job.PayloadJSON, &update)
 		update.MarketItemID, update.UserID, update.UserName = job.ResourceID, common.UserID(r), common.UserName(r)
-		// Only a successful submission with failed files is a parse-only retry.
-		// Download/materialization failures must replay their original pipeline.
-		update.RetryOnly = (job.Status == "succeeded" || job.Status == "canceled") && parse.Failed > 0
+		if hasPrebuiltUpdatePins(update) {
+			if job.Status != string(asyncjob.StatusFailed) {
+				common.ReplyAppErr(w, common.NewAppError(http.StatusConflict, common.ErrCodeConflict, "Only failed tasks can be retried"))
+				return
+			}
+			update.RetryOnly = false
+			predecessorID = job.ID
+		} else {
+			// Only a successful submission with failed files is a parse-only retry.
+			// Download/materialization failures must replay their original pipeline.
+			update.RetryOnly = (job.Status == "succeeded" || job.Status == "canceled") && parse.Failed > 0
+		}
 		payload = update
+	} else {
+		if predecessorID == "" {
+			_ = json.Unmarshal(job.PayloadJSON, &original)
+			original.MarketItemID, original.UserID, original.UserName = job.ResourceID, common.UserID(r), common.UserName(r)
+			if release := decodeInstallConfig(install).Prebuilt; release != nil {
+				if original.Prebuilt == nil {
+					original.Prebuilt = release
+				}
+				planPrebuiltRetry(&original, parse)
+			}
+		}
+		payload = original
 	}
-	newJob, err := enqueueMarketItem(r.Context(), db, asyncjob.EnqueueRequest{JobType: jobType, ResourceType: "knowledge_market_item", ResourceID: job.ResourceID, IdempotencyKey: "kb_retry:" + job.ResourceID + ":" + common.UserID(r), Payload: payload, MaxAttempts: 2, CreateUserID: common.UserID(r), CreateUserName: common.UserName(r)}, "")
+	newJob, err := enqueueMarketItemWithReplay(r.Context(), db, asyncjob.EnqueueRequest{JobType: jobType, ResourceType: "knowledge_market_item", ResourceID: job.ResourceID, IdempotencyKey: "kb_retry:" + job.ResourceID + ":" + common.UserID(r), Payload: payload, MaxAttempts: 2, CreateUserID: common.UserID(r), CreateUserName: common.UserName(r)}, "", predecessorID)
 	if err != nil {
 		replyServiceError(w, err)
 		return

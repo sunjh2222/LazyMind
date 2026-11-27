@@ -2,7 +2,8 @@ import ExternalLink from '@/components/ExternalLink';
 import { createPdfScrollSync } from "@/components/ui/pdfScrollSync";
 import FileUtils from "@/modules/knowledge/utils/file";
 import { TIME_FORMAT } from "@/modules/knowledge/constants/common";
-import { Button, Input, message, Modal, Popover, Segmented, Tag, Tooltip, Select, Switch, Spin } from "antd";
+import { Alert, Button, Input, message, Modal, Popover, Segmented, Tag, Tooltip, Select, Switch, Spin } from "antd";
+import { isAxiosError } from "axios";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, useCallback } from "react";
 import type { ChangeEvent, ReactNode } from "react";
 import { useTranslation } from "react-i18next";
@@ -23,6 +24,7 @@ import {
   SnippetsOutlined,
 } from "@ant-design/icons";
 import { isPaperLibrary } from "../../paper/store";
+import { safePaperUrl } from "../../paper/model";
 import moment from "moment";
 import { Doc } from "@/api/generated/core-client";
 import type { Conversation } from "@/api/generated/chatbot-client";
@@ -105,6 +107,8 @@ import "./paperWorkspace.scss";
 type KnowledgeDetail = Doc & {
   file_url?: string;
   download_file_url?: string;
+  prebuilt_source_path?: string;
+  prebuilt_source_url?: string;
 };
 
 type KnowledgeDatasetWithProcessingLevel = KnowledgeDataset & {
@@ -160,6 +164,7 @@ const KnowledgeDocumentContent = () => {
   const { knowledgeBaseId = "", knowledgeId = "" } = useParams();
   const documentKey=`${knowledgeBaseId}:${knowledgeId}`;
   const knowledgeDetail=loadedDocument?.key===documentKey?loadedDocument.detail:undefined;
+  const prebuiltSourcePath = knowledgeDetail?.prebuilt_source_path?.trim();
   const currentDataset=useDatasetPermissionStore(state=>state.currentDataset);
   const requestedDatasetId=useDatasetPermissionStore(state=>state.requestedDatasetId);
   const datasetError=useDatasetPermissionStore(state=>state.datasetError);
@@ -173,6 +178,7 @@ const KnowledgeDocumentContent = () => {
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
   const [segmentDetail, setSegmentDetail] = useState<Segment>();
+  const [missingCitation, setMissingCitation] = useState<{ group: string; segmentId: string }>();
   const [developerActive, setDeveloperActive] = useState(isDeveloperModeActive);
   const fileViewerRef = useRef<FileViewerRef>(null);
   const paperChatRef = useRef<PdfTemporaryChatHandle>(null);
@@ -366,8 +372,10 @@ const KnowledgeDocumentContent = () => {
   const [revisionLoading, setRevisionLoading] = useState(false);
   const [revisionTranslatingWith, setRevisionTranslatingWith] = useState<"api" | "llm">();
   const cancelledPdfJobsRef = useRef(new Set<string>());
+  const prebuiltSegmentsReady =
+    Boolean(prebuiltSourcePath) && datasetIdentified && knowledgeDetail?.processing_status === "ready";
   const canShowSegments =
-    developerActive && processingLevelSupportsSegments(processingLevel);
+    (developerActive || prebuiltSegmentsReady) && processingLevelSupportsSegments(processingLevel);
 
   const refreshPdfCapabilities = useCallback(async () => {
     if (!knowledgeBaseId || !knowledgeId) return;
@@ -609,6 +617,7 @@ const KnowledgeDocumentContent = () => {
   const segmentId = useMemo(() => {
     return searchParams.get("segement_id") || "";
   }, [searchParams]);
+  const hasCitationLookup = Boolean(segmentId && (group || prebuiltSourcePath));
 
   useEffect(() => {
     let cancelled = false;
@@ -654,24 +663,29 @@ const KnowledgeDocumentContent = () => {
     };
   }, []);
 
-  const getSegmentDetail = useCallback(() => {
-    if (group && segmentId) {
-      SegmentServiceApi()
-        .segmentServiceGetSegment({
-          dataset: knowledgeBaseId,
-          document: knowledgeId,
-          segment: segmentId,
-          group: group,
-        })
-        .then((res) => {
-          setSegmentDetail(res.data);
-        });
-    }
-  }, [group, segmentId, knowledgeBaseId, knowledgeId]);
-
   useEffect(() => {
-    getSegmentDetail();
-  }, [group, segmentId, getSegmentDetail]);
+    setSegmentDetail(undefined);
+    setMissingCitation(undefined);
+    if (!hasCitationLookup) return;
+
+    const controller = new AbortController();
+    void SegmentServiceApi()
+      .segmentServiceGetSegment({
+        dataset: knowledgeBaseId,
+        document: knowledgeId,
+        segment: segmentId,
+        group: group || undefined,
+      }, { signal: controller.signal })
+      .then((res) => {
+        if (!controller.signal.aborted) setSegmentDetail(res.data);
+      })
+      .catch((error: unknown) => {
+        if (!controller.signal.aborted && isAxiosError(error) && error.response?.status === 404) {
+          setMissingCitation({ group, segmentId });
+        }
+      });
+    return () => controller.abort();
+  }, [group, hasCitationLookup, knowledgeBaseId, knowledgeId, segmentId]);
 
   const originalPreviewFile = useMemo(() => {
     const filePath = /\.pdf$/i.test(knowledgeDetail?.display_name || "")
@@ -982,8 +996,16 @@ const KnowledgeDocumentContent = () => {
     t,
   ]);
 
+  const prebuiltSourceUrl = prebuiltSourcePath ? safePaperUrl(knowledgeDetail?.prebuilt_source_url) : undefined;
   const documentMetadata = [
-          { label: t("knowledge.source"), value: t("knowledge.localFile") },
+          {
+            label: t("knowledge.source"),
+            value: prebuiltSourceUrl ? (
+              <ExternalLink href={prebuiltSourceUrl} rel="noreferrer noopener" target="_blank">
+                {prebuiltSourcePath}
+              </ExternalLink>
+            ) : prebuiltSourcePath || t("knowledge.localFile"),
+          },
           {
             label: t("knowledge.createTime"),
             value: moment(knowledgeDetail?.create_time).format(TIME_FORMAT),
@@ -993,7 +1015,7 @@ const KnowledgeDocumentContent = () => {
             value: knowledgeDetail?.creator || "-",
           },
           {
-            label: t("knowledge.originalFile"),
+            label: t(prebuiltSourcePath ? "knowledge.documentTextFile" : "knowledge.originalFile"),
             value: (
               <ExternalLink
                 href={isPdfDocument ? originalPreviewFile : previewFile}
@@ -1060,6 +1082,9 @@ const KnowledgeDocumentContent = () => {
       <div ref={workspaceRef} className="knowledge-preview-layout knowledge-paper-workspace" data-panel-layout={panelLayout} data-panel-open={!previewSideCollapsed} data-narrow={workspaceWidth<1100} data-compact={workspaceWidth<900} style={{"--paper-assistant-width": `${Math.min(paperAssistantWidth, Math.max(320, workspaceWidth * .5))}px`} as React.CSSProperties}>
         <div className="knowledge-preview-file-column paper-reader-pane">
           {!isPdfDocument && <header className="document-reader-header">{readerBackButton}<span title={knowledgeDetail?.display_name}>{knowledgeDetail?.display_name}</span>{readerDocumentActions()}</header>}
+          {prebuiltSourcePath && missingCitation?.group === group && missingCitation.segmentId === segmentId && (
+            <Alert banner showIcon type="warning" message={t("knowledge.missingHistoricalCitation")} />
+          )}
           {isPdfDocument && <PaperOutlineRail document={paperIR} nativeOutline={nativePdfOutline} currentPage={pdfViewPosition.page} onNavigate={navigatePaperBlock} onNavigatePage={navigatePaperPage}/> }
             <FileViewer
               ref={fileViewerRef}
@@ -1132,7 +1157,7 @@ const KnowledgeDocumentContent = () => {
               </div></div>
               {!isPaperDocument && <div className="paper-assistant-pane document-navigation-pane" hidden={previewSideTab !== "navigation"}>
           <PaperReaderSidebar paperMode={datasetIdentified&&isPaperLibrary(currentDataset?.scene)} currentPage={pdfViewPosition.page} isPdf={isPdfDocument} document={paperIR} nativeOutline={nativePdfOutline} activeTab={paperNavTab} onTabChange={setPaperNavTab} onNavigate={navigatePaperBlock} onNavigatePage={navigatePaperPage} onCollapse={()=>setPreviewSideCollapsed(true)} referenceCount={referenceCount}
-            segments={canShowSegments&&knowledgeDetail?<><div className="paper-segment-options"><Select value={segmentViewKey||undefined} options={segmentViewOptions} onChange={setSegmentViewKey}/><label>{t("knowledge.sequence")} <Switch size="small" checked={showSegmentSequence} onChange={setShowSegmentSequence}/></label></div><KnowledgeTabs knowledgeDetail={knowledgeDetail} onGetItemInfo={setSegmentDetail} onAskSegment={askSegment} activeKey={segmentViewKey} onActiveKeyChange={setSegmentViewKey} onOptionsChange={handleSegmentViewOptionsChange} showSequence={showSegmentSequence}/></>:undefined}
+            segments={canShowSegments&&knowledgeDetail?<><div className="paper-segment-options"><Select value={segmentViewKey||undefined} options={segmentViewOptions} onChange={setSegmentViewKey}/><label>{t("knowledge.sequence")} <Switch size="small" checked={showSegmentSequence} onChange={setShowSegmentSequence}/></label></div><KnowledgeTabs knowledgeDetail={knowledgeDetail} onGetItemInfo={setSegmentDetail} onAskSegment={developerActive ? askSegment : undefined} activeKey={segmentViewKey} onActiveKeyChange={setSegmentViewKey} onOptionsChange={handleSegmentViewOptionsChange} showSequence={showSegmentSequence}/></>:undefined}
           />
               </div>}
               <div className="paper-assistant-pane" hidden={previewSideTab !== "translation"}>

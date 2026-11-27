@@ -22,6 +22,7 @@ import (
 	"lazymind/core/common/orm"
 	"lazymind/core/common/readonlyorm"
 	"lazymind/core/paperlibrary"
+	"lazymind/core/store"
 	"lazymind/core/systemdeps"
 )
 
@@ -188,6 +189,25 @@ type documentServiceRecord struct {
 	processing orm.DocumentProcessingState
 }
 
+func prebuiltDocumentReady(ext documentExt, state orm.DocumentProcessingState) error {
+	if ext.PrebuiltPath != "" && state.ChunkStatus != "succeeded" {
+		return &DocumentServiceError{Code: DocumentServiceUnavailable, Message: "预切片正文尚未导入完成"}
+	}
+	return nil
+}
+
+func requirePrebuiltDocumentReady(w http.ResponseWriter, r *http.Request, row orm.Document, ext documentExt) bool {
+	if ext.PrebuiltPath == "" {
+		return true
+	}
+	state, _, _, err := ObserveDocumentProcessingDetails(r.Context(), store.DB(), store.LazyLLMDB(), row)
+	if err != nil || prebuiltDocumentReady(ext, state) != nil {
+		common.ReplyErr(w, "预切片正文尚未导入完成", http.StatusServiceUnavailable)
+		return false
+	}
+	return true
+}
+
 func (s *DocumentService) GetDocumentMetadata(ctx context.Context, req DocumentGetRequest) (DocumentMetadata, error) {
 	rec, err := s.loadRecord(ctx, req.UserID, req.DatasetID, req.DocumentID, req.Caller)
 	if err != nil {
@@ -295,6 +315,9 @@ func (s *DocumentService) GetDocument(ctx context.Context, req DocumentReadReque
 }
 
 func readDocumentContentFromRecord(rec documentServiceRecord) (DocumentContent, error) {
+	if err := prebuiltDocumentReady(rec.ext, rec.processing); err != nil {
+		return DocumentContent{}, err
+	}
 	if artifact, err := readBaseArtifact(context.Background(), rec); err != nil {
 		return DocumentContent{}, err
 	} else if artifact != nil {
@@ -332,6 +355,9 @@ func readDocumentContentFromRecord(rec documentServiceRecord) (DocumentContent, 
 }
 
 func listDocumentChunksFromRecord(ctx context.Context, rec documentServiceRecord, datasetID, documentID, pageToken string, requestedPageSize int, requestedGroup string) (DocumentChunksResult, error) {
+	if err := prebuiltDocumentReady(rec.ext, rec.processing); err != nil {
+		return DocumentChunksResult{}, err
+	}
 	if artifact, err := readBaseArtifact(ctx, rec); err != nil {
 		return DocumentChunksResult{}, err
 	} else if artifact != nil && (rec.row.LazyllmDocID == "" || !systemdeps.PythonComponentActive("rag") ||

@@ -30,12 +30,15 @@ const (
 // updateJobPayload carries everything the async update job needs. Force is
 // reserved so a future admin/UI path can skip the change check and re-import.
 type updateJobPayload struct {
-	MarketItemID string `json:"market_item_id"`
-	UserID       string `json:"user_id"`
-	UserName     string `json:"user_name"`
-	Revision     string `json:"revision,omitempty"`
-	Force        bool   `json:"force,omitempty"`
-	RetryOnly    bool   `json:"retry_only,omitempty"`
+	MarketItemID      string           `json:"market_item_id"`
+	UserID            string           `json:"user_id"`
+	UserName          string           `json:"user_name"`
+	Revision          string           `json:"revision,omitempty"`
+	Force             bool             `json:"force,omitempty"`
+	RetryOnly         bool             `json:"retry_only,omitempty"`
+	PrebuiltFrom      *prebuiltRelease `json:"prebuilt_from,omitempty"`
+	PrebuiltTarget    *prebuiltRelease `json:"prebuilt_target,omitempty"`
+	PrebuiltDatasetID string           `json:"prebuilt_dataset_id,omitempty"`
 }
 
 // updateAllJobPayload is the one-click update-all batch payload.
@@ -83,17 +86,22 @@ func MarketUpdate(w http.ResponseWriter, r *http.Request) {
 		common.ReplyErr(w, "knowledge base task is running, retry later", http.StatusConflict)
 		return
 	}
+	payload := updateJobPayload{
+		MarketItemID: marketItemID,
+		UserID:       userID,
+		UserName:     userName,
+		Revision:     item.PackageRevision,
+	}
+	if installed := decodeInstallConfig(install).Prebuilt; installed != nil &&
+		!pinPrebuiltUpdate(w, r, db, &item, install, installed, &payload) {
+		return
+	}
 	job, err := enqueueMarketItem(r.Context(), db, asyncjob.EnqueueRequest{
 		JobType:        updateJobType,
 		ResourceType:   "knowledge_market_item",
 		ResourceID:     marketItemID,
 		IdempotencyKey: "kb_update:" + marketItemID + ":" + userID,
-		Payload: updateJobPayload{
-			MarketItemID: marketItemID,
-			UserID:       userID,
-			UserName:     userName,
-			Revision:     item.PackageRevision,
-		},
+		Payload:        payload,
 		MaxAttempts:    2,
 		CreateUserID:   userID,
 		CreateUserName: userName,
@@ -187,6 +195,13 @@ func HandleUpdateJob(ctx context.Context, job asyncjob.Job, reporter asyncjob.Re
 	if install == nil || strings.TrimSpace(install.DatasetID) == "" {
 		return skippedUpdateResult("not_installed")
 	}
+	if payload.PrebuiltFrom != nil {
+		return handlePrebuiltUpdate(ctx, db, job, reporter, payload, install)
+	}
+	oldCfg := decodeInstallConfig(install)
+	if oldCfg.Prebuilt != nil {
+		return skippedUpdateResult("prebuilt_update_unavailable")
+	}
 	var ds orm.Dataset
 	if err := db.WithContext(ctx).Where("id = ? AND deleted_at IS NULL", install.DatasetID).Take(&ds).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -210,7 +225,6 @@ func HandleUpdateJob(ctx context.Context, job asyncjob.Job, reporter asyncjob.Re
 		return failUpdate(ctx, db, payload, errors.New("knowledge base has no package url"))
 	}
 
-	oldCfg := decodeInstallConfig(install)
 	isGit := strings.HasSuffix(strings.ToLower(packageURL), ".git")
 	hasDocs, err := datasetHasDocuments(ctx, db, ds.ID)
 	if err != nil {
@@ -437,6 +451,10 @@ func marketItemHasUpdate(ctx context.Context, item *orm.KnowledgeMarketItem, ins
 	if item == nil || install == nil {
 		return false, nil
 	}
+	cfg := decodeInstallConfig(install)
+	if cfg.Prebuilt != nil {
+		return false, nil
+	}
 	parse := parseProgress((&http.Request{}).WithContext(ctx), store.DB(), install)
 	if parseIsActive(parse) {
 		return false, nil
@@ -444,7 +462,6 @@ func marketItemHasUpdate(ctx context.Context, item *orm.KnowledgeMarketItem, ins
 	if parse.Failed > 0 {
 		return true, nil
 	}
-	cfg := decodeInstallConfig(install)
 	if strings.TrimSpace(install.DatasetID) != "" {
 		hasDocs, err := datasetHasDocuments(ctx, store.DB(), install.DatasetID)
 		if err != nil {
@@ -490,6 +507,13 @@ func decodeUpdatePayload(raw json.RawMessage) (updateJobPayload, error) {
 	payload.Revision = strings.TrimSpace(payload.Revision)
 	if payload.MarketItemID == "" || payload.UserID == "" {
 		return payload, errors.New("invalid update payload")
+	}
+	if hasPrebuiltUpdatePins(payload) &&
+		(payload.PrebuiltFrom == nil || payload.PrebuiltTarget == nil || payload.PrebuiltDatasetID == "" ||
+			!validPrebuiltRelease(payload.PrebuiltFrom, payload.MarketItemID) ||
+			!validPrebuiltRelease(payload.PrebuiltTarget, payload.MarketItemID) ||
+			payload.PrebuiltFrom.URL != payload.PrebuiltTarget.URL) {
+		return payload, errors.New("invalid prebuilt update payload")
 	}
 	return payload, nil
 }

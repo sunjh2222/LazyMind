@@ -3,12 +3,15 @@ import type { RawAxiosRequestConfig } from "axios";
 import {
   Configuration,
   KnowledgeMarketApiFactory,
+  type InstallPreview,
+  type InstallRequest,
   type KnowledgeMarketDetailOpenAPIResponse,
   type KnowledgeMarketDomainsOpenAPIResponse,
   type KnowledgeMarketInstallOpenAPIResponse,
   type KnowledgeMarketInstallsOpenAPIResponse,
   type KnowledgeMarketListItemOpenAPIResponse,
   type KnowledgeMarketTaskDetailOpenAPIResponse,
+  type KnowledgeMarketTaskListItemOpenAPIResponse,
   type KnowledgeMarketTaskListOpenAPIResponse,
   type KnowledgeMarketTaskFilesOpenAPIResponse,
   type KnowledgeMarketTaskFileOpenAPIResponse,
@@ -31,6 +34,22 @@ type KnowledgeMarketRequestOptions = RawAxiosRequestConfig & {
 
 export type KnowledgeMarketDetail = KnowledgeMarketDetailOpenAPIResponse & {
   online_access_url?: string;
+};
+
+export interface KnowledgeMarketIndexProgress {
+  state: "waiting" | "running" | "succeeded" | "partial_failed" | "failed" | "unknown" | "canceled";
+  total: number;
+  done: number;
+  failed: number;
+  pending: number;
+  unknown: number;
+}
+
+type WithIndexProgress<T> = T & { index_progress?: KnowledgeMarketIndexProgress };
+export type KnowledgeMarketTaskDetail = WithIndexProgress<KnowledgeMarketTaskDetailOpenAPIResponse>;
+export type KnowledgeMarketTaskListItem = WithIndexProgress<KnowledgeMarketTaskListItemOpenAPIResponse>;
+export type KnowledgeMarketTaskList = Omit<KnowledgeMarketTaskListOpenAPIResponse, "items"> & {
+  items?: KnowledgeMarketTaskListItem[];
 };
 
 function unwrap<T>(payload: T | CoreEnvelope<T>): T {
@@ -104,12 +123,26 @@ export async function getKnowledgeMarketItem(
 
 export async function installKnowledgeMarketItem(
   marketItemId: string,
+  installRequest?: InstallRequest,
+  options?: KnowledgeMarketRequestOptions,
 ): Promise<KnowledgeMarketInstallOpenAPIResponse> {
   const response =
     await knowledgeMarketClient.apiCoreKnowledgeMarketItemsMarketItemIdInstallPost(
-      { marketItemId },
+      { marketItemId, installRequest },
+      options,
     );
   return unwrap(response.data);
+}
+
+export async function getKnowledgeMarketInstallPreview(
+  marketItemId: string,
+  options?: KnowledgeMarketRequestOptions,
+): Promise<InstallPreview> {
+  const response = await knowledgeMarketClient.apiCoreKnowledgeMarketItemsMarketItemIdInstallPreviewGet(
+    { marketItemId },
+    options,
+  );
+  return response.data.data;
 }
 
 export async function updateKnowledgeMarketItem(
@@ -131,7 +164,7 @@ export async function updateAllKnowledgeMarketItems(): Promise<KnowledgeMarketIn
 export async function listKnowledgeMarketTasks(
   jobType: string,
   options?: KnowledgeMarketRequestOptions,
-): Promise<KnowledgeMarketTaskListOpenAPIResponse> {
+): Promise<KnowledgeMarketTaskList> {
   const pageSize = 100;
   const response = await knowledgeMarketClient.apiCoreKnowledgeMarketTasksGet(
     { page: 1, pageSize, jobType },
@@ -153,7 +186,7 @@ export async function listKnowledgeMarketTasks(
 export async function getKnowledgeMarketTask(
   jobId: string,
   options?: KnowledgeMarketRequestOptions,
-): Promise<KnowledgeMarketTaskDetailOpenAPIResponse> {
+): Promise<KnowledgeMarketTaskDetail> {
   const response =
     await knowledgeMarketClient.apiCoreKnowledgeMarketTasksJobIdGet(
       { jobId },
@@ -166,7 +199,7 @@ export async function deleteKnowledgeMarketTask(jobId: string): Promise<void> {
   await knowledgeMarketClient.apiCoreKnowledgeMarketTasksJobIdDelete({ jobId });
 }
 
-export async function retryKnowledgeMarketTask(jobId: string): Promise<KnowledgeMarketInstallOpenAPIResponse> {
+export async function retryKnowledgeMarketTask(jobId: string): Promise<KnowledgeMarketInstallOpenAPIResponse & { parent_job_id?: string }> {
   const response = await knowledgeMarketClient.apiCoreKnowledgeMarketTasksJobIdRetryPost({ jobId });
   return unwrap(response.data);
 }
@@ -178,7 +211,7 @@ export async function cancelKnowledgeMarketTask(jobId: string) {
 
 export type KnowledgeMarketFileStatus = KnowledgeMarketTaskFileOpenAPIResponse["status"];
 
-export async function listKnowledgeMarketTaskPage(page: number, options?: KnowledgeMarketRequestOptions): Promise<KnowledgeMarketTaskListOpenAPIResponse> {
+export async function listKnowledgeMarketTaskPage(page: number, options?: KnowledgeMarketRequestOptions): Promise<KnowledgeMarketTaskList> {
   const response = await knowledgeMarketClient.apiCoreKnowledgeMarketTasksGet(
     { jobType: "all", view: "summary", page, pageSize: 10 }, options,
   );

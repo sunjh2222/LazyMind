@@ -104,6 +104,12 @@ func (s *DocumentService) EnsureDocumentParsed(r *http.Request, req EnsureDocume
 	if err != nil {
 		return EnsureDocumentParsedResult{}, err
 	}
+	if rec.ext.PrebuiltPath != "" {
+		if err := prebuiltDocumentReady(rec.ext, rec.processing); err != nil {
+			return EnsureDocumentParsedResult{}, err
+		}
+		return EnsureDocumentParsedResult{Status: "parsed"}, nil
+	}
 	// Older releases cleared parsed chunks too; only those legacy rows need a full reparse.
 	if rec.processing.EmbeddingVersion == embeddingVersionReembedManual && rec.processing.ParseStatus != "succeeded" {
 		return EnsureDocumentParsedResult{}, &DocumentServiceError{Code: DocumentServiceUnavailable, Message: "Parsed content is unavailable. Reparse this document manually in the knowledge base."}

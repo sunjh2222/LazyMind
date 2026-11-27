@@ -4428,6 +4428,8 @@ export interface Doc {
     'name': string;
     'p_id': string;
     'pdf_convert_result'?: string;
+    'prebuilt_source_path'?: string;
+    'prebuilt_source_url'?: string;
     'processing_error'?: ProcessingDiagnostic;
     'processing_status'?: string;
     'recursive_document_count'?: number;
@@ -5910,6 +5912,53 @@ export interface InitUploadResponse {
     'upload_scope'?: string;
     'upload_state': string;
 }
+export interface InstallIndexProgress {
+    'done': number;
+    'failed': number;
+    'pending': number;
+    'state': InstallIndexProgressStateEnum;
+    'total': number;
+    'unknown': number;
+}
+
+export const InstallIndexProgressStateEnum = {
+    Waiting: 'waiting',
+    Running: 'running',
+    Succeeded: 'succeeded',
+    PartialFailed: 'partial_failed',
+    Failed: 'failed',
+    Unknown: 'unknown',
+    Canceled: 'canceled'
+} as const;
+
+export type InstallIndexProgressStateEnum = typeof InstallIndexProgressStateEnum[keyof typeof InstallIndexProgressStateEnum];
+
+export interface InstallPreview {
+    'chunk_count': number;
+    'document_count': number;
+    'item_id': string;
+    'manifest_sha256': string;
+    'size_bytes': number;
+    'vector_index': InstallPreviewVectorIndex;
+    'version': string;
+}
+export interface InstallPreviewVectorIndex {
+    'available': boolean;
+    'confirmation_token'?: string;
+    'model_name'?: string;
+}
+export interface InstallRequest {
+    'confirmation_token'?: string;
+    'processing_level'?: InstallRequestProcessingLevelEnum;
+}
+
+export const InstallRequestProcessingLevelEnum = {
+    Chunked: 'chunked',
+    Indexed: 'indexed'
+} as const;
+
+export type InstallRequestProcessingLevelEnum = typeof InstallRequestProcessingLevelEnum[keyof typeof InstallRequestProcessingLevelEnum];
+
 export interface InternalSkillCreateOpenAPIRequest {
     'category': string;
     'content': string;
@@ -5969,7 +6018,16 @@ export type KnowledgeMarketFileFailureOpenAPIResponseReasonEnum = typeof Knowled
 
 export interface KnowledgeMarketInstallOpenAPIResponse {
     'job_id': string;
+    /**
+     * Public installation task to follow for an index retry. The job_id can identify an internal index job.
+     */
+    'parent_job_id'?: string;
     'state': string;
+}
+export interface KnowledgeMarketInstallPreviewOpenAPIResponse {
+    'code': number;
+    'data': InstallPreview;
+    'message': string;
 }
 export interface KnowledgeMarketInstallsOpenAPIResponse {
     'items'?: Array<KnowledgeMarketInstallsOpenAPIResponseItem>;
@@ -6008,6 +6066,11 @@ export interface KnowledgeMarketListOpenAPIResponse {
     'page_size': number;
     'total': number;
 }
+export interface KnowledgeMarketPrebuiltUpdatePreviewOpenAPIResponse {
+    'code': number;
+    'data': PrebuiltUpdatePreview;
+    'message': string;
+}
 export interface KnowledgeMarketTaskCancelOpenAPIResponse {
     'canceled': number;
     'job_id': string;
@@ -6029,6 +6092,7 @@ export interface KnowledgeMarketTaskDetailOpenAPIResponse {
     'error_message': string;
     'finished_at'?: string;
     'icon': string;
+    'index_progress'?: InstallIndexProgress;
     'install_state': string;
     'job_id': string;
     'job_status': string;
@@ -6104,6 +6168,7 @@ export interface KnowledgeMarketTaskListItemOpenAPIResponse {
     'error_message': string;
     'finished_at'?: string;
     'icon': string;
+    'index_progress'?: InstallIndexProgress;
     'install_state': string;
     'job_id': string;
     'job_status': string;
@@ -7417,6 +7482,16 @@ export interface PolishSelectionRange {
 export interface PostStepCheckpoint {
     'result': Result;
     'workflow_revision': string;
+}
+export interface PrebuiltUpdatePreview {
+    'added': Array<string>;
+    'changed': Array<string>;
+    'download_bytes': number;
+    'has_update': boolean;
+    'installed_version': string;
+    'removed': Array<string>;
+    'target_version': string;
+    'unchanged_count': number;
 }
 export interface PreferenceOrganizerPass {
     'after'?: PreferenceOrganizerState | null;
@@ -57124,16 +57199,87 @@ export const KnowledgeMarketApiAxiosParamCreator = function (configuration?: Con
             };
         },
         /**
-         * Enqueues a background install job that downloads the package, creates a personal dataset and submits every file to the parsing/vectorizing pipeline. Returns the job id; progress is polled via GET /knowledge-market/tasks/{job_id}. Conflicts with an in-flight install/update of the same item return 409.
+         * Enqueues the install job. Prebuilt items default to text chunks. An indexed request requires a valid confirmation value from the install preview and records the confirmed model and release for the job. Prebuilt jobs currently import text chunks. An empty body preserves the existing original-source install behavior. Poll progress at GET /knowledge-market/tasks/{job_id}.
          * @summary Install an official knowledge base
+         * @param {string} marketItemId
+         * @param {InstallRequest} [installRequest]
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        apiCoreKnowledgeMarketItemsMarketItemIdInstallPost: async (marketItemId: string, installRequest?: InstallRequest, options: RawAxiosRequestConfig = {}): Promise<RequestArgs> => {
+            // verify required parameter 'marketItemId' is not null or undefined
+            assertParamExists('apiCoreKnowledgeMarketItemsMarketItemIdInstallPost', 'marketItemId', marketItemId)
+            const localVarPath = `/api/core/knowledge-market/items/{market_item_id}:install`
+                .replace(`{${"market_item_id"}}`, encodeURIComponent(String(marketItemId)));
+            // use dummy base URL string because the URL constructor only accepts absolute URLs.
+            const localVarUrlObj = new URL(localVarPath, DUMMY_BASE_URL);
+            let baseOptions;
+            if (configuration) {
+                baseOptions = configuration.baseOptions;
+            }
+
+            const localVarRequestOptions = { method: 'POST', ...baseOptions, ...options};
+            const localVarHeaderParameter = {} as any;
+            const localVarQueryParameter = {} as any;
+
+            localVarHeaderParameter['Content-Type'] = 'application/json';
+            localVarHeaderParameter['Accept'] = 'application/json';
+
+            setSearchParams(localVarUrlObj, localVarQueryParameter);
+            let headersFromBaseOptions = baseOptions && baseOptions.headers ? baseOptions.headers : {};
+            localVarRequestOptions.headers = {...localVarHeaderParameter, ...headersFromBaseOptions, ...options.headers};
+            localVarRequestOptions.data = serializeDataIfNeeded(installRequest, localVarRequestOptions, configuration)
+
+            return {
+                url: toPathString(localVarUrlObj),
+                options: localVarRequestOptions,
+            };
+        },
+        /**
+         * Returns verified release counts and embedding model availability. If the model is ready, the response includes a short-lived confirmation value for this user, release, and model. Previewing has no installation side effects.
+         * @summary Preview installation of a prebuilt knowledge base
          * @param {string} marketItemId
          * @param {*} [options] Override http request option.
          * @throws {RequiredError}
          */
-        apiCoreKnowledgeMarketItemsMarketItemIdInstallPost: async (marketItemId: string, options: RawAxiosRequestConfig = {}): Promise<RequestArgs> => {
+        apiCoreKnowledgeMarketItemsMarketItemIdInstallPreviewGet: async (marketItemId: string, options: RawAxiosRequestConfig = {}): Promise<RequestArgs> => {
             // verify required parameter 'marketItemId' is not null or undefined
-            assertParamExists('apiCoreKnowledgeMarketItemsMarketItemIdInstallPost', 'marketItemId', marketItemId)
-            const localVarPath = `/api/core/knowledge-market/items/{market_item_id}:install`
+            assertParamExists('apiCoreKnowledgeMarketItemsMarketItemIdInstallPreviewGet', 'marketItemId', marketItemId)
+            const localVarPath = `/api/core/knowledge-market/items/{market_item_id}/install-preview`
+                .replace(`{${"market_item_id"}}`, encodeURIComponent(String(marketItemId)));
+            // use dummy base URL string because the URL constructor only accepts absolute URLs.
+            const localVarUrlObj = new URL(localVarPath, DUMMY_BASE_URL);
+            let baseOptions;
+            if (configuration) {
+                baseOptions = configuration.baseOptions;
+            }
+
+            const localVarRequestOptions = { method: 'GET', ...baseOptions, ...options};
+            const localVarHeaderParameter = {} as any;
+            const localVarQueryParameter = {} as any;
+
+            localVarHeaderParameter['Accept'] = 'application/json';
+
+            setSearchParams(localVarUrlObj, localVarQueryParameter);
+            let headersFromBaseOptions = baseOptions && baseOptions.headers ? baseOptions.headers : {};
+            localVarRequestOptions.headers = {...localVarHeaderParameter, ...headersFromBaseOptions, ...options.headers};
+
+            return {
+                url: toPathString(localVarUrlObj),
+                options: localVarRequestOptions,
+            };
+        },
+        /**
+         * Enqueues a background update job. Original-source installations refresh their documents from the new package. Prebuilt installations support a release with one changed document and no additions or removals. The changed document is switched to the new text after successful import, and unchanged documents and their indexes are preserved. No-change updates finish with updated=false. An in-flight install or update of the same item returns 409. If the item is not installed, the request returns 404.
+         * @summary Update one installed official knowledge base
+         * @param {string} marketItemId
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        apiCoreKnowledgeMarketItemsMarketItemIdUpdatePost: async (marketItemId: string, options: RawAxiosRequestConfig = {}): Promise<RequestArgs> => {
+            // verify required parameter 'marketItemId' is not null or undefined
+            assertParamExists('apiCoreKnowledgeMarketItemsMarketItemIdUpdatePost', 'marketItemId', marketItemId)
+            const localVarPath = `/api/core/knowledge-market/items/{market_item_id}:update`
                 .replace(`{${"market_item_id"}}`, encodeURIComponent(String(marketItemId)));
             // use dummy base URL string because the URL constructor only accepts absolute URLs.
             const localVarUrlObj = new URL(localVarPath, DUMMY_BASE_URL);
@@ -57158,16 +57304,16 @@ export const KnowledgeMarketApiAxiosParamCreator = function (configuration?: Con
             };
         },
         /**
-         * Enqueues a background update job (strategy A: clear old documents then import the new package). No-change updates finish with updated=false and write nothing. Conflicts with an in-flight install/update of the same item return 409; not-installed items return 404.
-         * @summary Update one installed official knowledge base
+         * Compares verified release manifests and reports changed source document IDs and the size of the required chunk objects. This read-only operation does not download chunk objects, enqueue tasks, or modify the installed knowledge base.
+         * @summary Preview changes to an installed prebuilt knowledge base
          * @param {string} marketItemId
          * @param {*} [options] Override http request option.
          * @throws {RequiredError}
          */
-        apiCoreKnowledgeMarketItemsMarketItemIdUpdatePost: async (marketItemId: string, options: RawAxiosRequestConfig = {}): Promise<RequestArgs> => {
+        apiCoreKnowledgeMarketItemsMarketItemIdUpdatePreviewGet: async (marketItemId: string, options: RawAxiosRequestConfig = {}): Promise<RequestArgs> => {
             // verify required parameter 'marketItemId' is not null or undefined
-            assertParamExists('apiCoreKnowledgeMarketItemsMarketItemIdUpdatePost', 'marketItemId', marketItemId)
-            const localVarPath = `/api/core/knowledge-market/items/{market_item_id}:update`
+            assertParamExists('apiCoreKnowledgeMarketItemsMarketItemIdUpdatePreviewGet', 'marketItemId', marketItemId)
+            const localVarPath = `/api/core/knowledge-market/items/{market_item_id}/update-preview`
                 .replace(`{${"market_item_id"}}`, encodeURIComponent(String(marketItemId)));
             // use dummy base URL string because the URL constructor only accepts absolute URLs.
             const localVarUrlObj = new URL(localVarPath, DUMMY_BASE_URL);
@@ -57176,7 +57322,7 @@ export const KnowledgeMarketApiAxiosParamCreator = function (configuration?: Con
                 baseOptions = configuration.baseOptions;
             }
 
-            const localVarRequestOptions = { method: 'POST', ...baseOptions, ...options};
+            const localVarRequestOptions = { method: 'GET', ...baseOptions, ...options};
             const localVarHeaderParameter = {} as any;
             const localVarQueryParameter = {} as any;
 
@@ -57398,8 +57544,8 @@ export const KnowledgeMarketApiAxiosParamCreator = function (configuration?: Con
             };
         },
         /**
-         * Enqueues new work for the current user\'s failed or partially failed task. Successful files are retained. Active or successful tasks return 409.
-         * @summary Retry a failed knowledge market task
+         * Retries failed file processing while retaining successful files. For an indexed prebuilt installation, resubmits only confirmed indexing failures or work that was never sent. The parent_job_id identifies the public task to follow. Recovering an already accepted receipt without submitting new work returns the original installation job_id with state succeeded. Active or ineligible work returns 409.
+         * @summary Retry knowledge market processing or indexing
          * @param {string} jobId
          * @param {*} [options] Override http request option.
          * @throws {RequiredError}
@@ -57525,20 +57671,34 @@ export const KnowledgeMarketApiFp = function(configuration?: Configuration) {
             return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
         },
         /**
-         * Enqueues a background install job that downloads the package, creates a personal dataset and submits every file to the parsing/vectorizing pipeline. Returns the job id; progress is polled via GET /knowledge-market/tasks/{job_id}. Conflicts with an in-flight install/update of the same item return 409.
+         * Enqueues the install job. Prebuilt items default to text chunks. An indexed request requires a valid confirmation value from the install preview and records the confirmed model and release for the job. Prebuilt jobs currently import text chunks. An empty body preserves the existing original-source install behavior. Poll progress at GET /knowledge-market/tasks/{job_id}.
          * @summary Install an official knowledge base
          * @param {string} marketItemId
+         * @param {InstallRequest} [installRequest]
          * @param {*} [options] Override http request option.
          * @throws {RequiredError}
          */
-        async apiCoreKnowledgeMarketItemsMarketItemIdInstallPost(marketItemId: string, options?: RawAxiosRequestConfig): Promise<(axios?: AxiosInstance, basePath?: string) => AxiosPromise<KnowledgeMarketInstallOpenAPIResponse>> {
-            const localVarAxiosArgs = await localVarAxiosParamCreator.apiCoreKnowledgeMarketItemsMarketItemIdInstallPost(marketItemId, options);
+        async apiCoreKnowledgeMarketItemsMarketItemIdInstallPost(marketItemId: string, installRequest?: InstallRequest, options?: RawAxiosRequestConfig): Promise<(axios?: AxiosInstance, basePath?: string) => AxiosPromise<KnowledgeMarketInstallOpenAPIResponse>> {
+            const localVarAxiosArgs = await localVarAxiosParamCreator.apiCoreKnowledgeMarketItemsMarketItemIdInstallPost(marketItemId, installRequest, options);
             const localVarOperationServerIndex = configuration?.serverIndex ?? 0;
             const localVarOperationServerBasePath = operationServerMap['KnowledgeMarketApi.apiCoreKnowledgeMarketItemsMarketItemIdInstallPost']?.[localVarOperationServerIndex]?.url;
             return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
         },
         /**
-         * Enqueues a background update job (strategy A: clear old documents then import the new package). No-change updates finish with updated=false and write nothing. Conflicts with an in-flight install/update of the same item return 409; not-installed items return 404.
+         * Returns verified release counts and embedding model availability. If the model is ready, the response includes a short-lived confirmation value for this user, release, and model. Previewing has no installation side effects.
+         * @summary Preview installation of a prebuilt knowledge base
+         * @param {string} marketItemId
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        async apiCoreKnowledgeMarketItemsMarketItemIdInstallPreviewGet(marketItemId: string, options?: RawAxiosRequestConfig): Promise<(axios?: AxiosInstance, basePath?: string) => AxiosPromise<KnowledgeMarketInstallPreviewOpenAPIResponse>> {
+            const localVarAxiosArgs = await localVarAxiosParamCreator.apiCoreKnowledgeMarketItemsMarketItemIdInstallPreviewGet(marketItemId, options);
+            const localVarOperationServerIndex = configuration?.serverIndex ?? 0;
+            const localVarOperationServerBasePath = operationServerMap['KnowledgeMarketApi.apiCoreKnowledgeMarketItemsMarketItemIdInstallPreviewGet']?.[localVarOperationServerIndex]?.url;
+            return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
+        },
+        /**
+         * Enqueues a background update job. Original-source installations refresh their documents from the new package. Prebuilt installations support a release with one changed document and no additions or removals. The changed document is switched to the new text after successful import, and unchanged documents and their indexes are preserved. No-change updates finish with updated=false. An in-flight install or update of the same item returns 409. If the item is not installed, the request returns 404.
          * @summary Update one installed official knowledge base
          * @param {string} marketItemId
          * @param {*} [options] Override http request option.
@@ -57548,6 +57708,19 @@ export const KnowledgeMarketApiFp = function(configuration?: Configuration) {
             const localVarAxiosArgs = await localVarAxiosParamCreator.apiCoreKnowledgeMarketItemsMarketItemIdUpdatePost(marketItemId, options);
             const localVarOperationServerIndex = configuration?.serverIndex ?? 0;
             const localVarOperationServerBasePath = operationServerMap['KnowledgeMarketApi.apiCoreKnowledgeMarketItemsMarketItemIdUpdatePost']?.[localVarOperationServerIndex]?.url;
+            return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
+        },
+        /**
+         * Compares verified release manifests and reports changed source document IDs and the size of the required chunk objects. This read-only operation does not download chunk objects, enqueue tasks, or modify the installed knowledge base.
+         * @summary Preview changes to an installed prebuilt knowledge base
+         * @param {string} marketItemId
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        async apiCoreKnowledgeMarketItemsMarketItemIdUpdatePreviewGet(marketItemId: string, options?: RawAxiosRequestConfig): Promise<(axios?: AxiosInstance, basePath?: string) => AxiosPromise<KnowledgeMarketPrebuiltUpdatePreviewOpenAPIResponse>> {
+            const localVarAxiosArgs = await localVarAxiosParamCreator.apiCoreKnowledgeMarketItemsMarketItemIdUpdatePreviewGet(marketItemId, options);
+            const localVarOperationServerIndex = configuration?.serverIndex ?? 0;
+            const localVarOperationServerBasePath = operationServerMap['KnowledgeMarketApi.apiCoreKnowledgeMarketItemsMarketItemIdUpdatePreviewGet']?.[localVarOperationServerIndex]?.url;
             return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
         },
         /**
@@ -57623,8 +57796,8 @@ export const KnowledgeMarketApiFp = function(configuration?: Configuration) {
             return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
         },
         /**
-         * Enqueues new work for the current user\'s failed or partially failed task. Successful files are retained. Active or successful tasks return 409.
-         * @summary Retry a failed knowledge market task
+         * Retries failed file processing while retaining successful files. For an indexed prebuilt installation, resubmits only confirmed indexing failures or work that was never sent. The parent_job_id identifies the public task to follow. Recovering an already accepted receipt without submitting new work returns the original installation job_id with state succeeded. Active or ineligible work returns 409.
+         * @summary Retry knowledge market processing or indexing
          * @param {string} jobId
          * @param {*} [options] Override http request option.
          * @throws {RequiredError}
@@ -57695,17 +57868,27 @@ export const KnowledgeMarketApiFactory = function (configuration?: Configuration
             return localVarFp.apiCoreKnowledgeMarketItemsMarketItemIdGet(requestParameters.marketItemId, options).then((request) => request(axios, basePath));
         },
         /**
-         * Enqueues a background install job that downloads the package, creates a personal dataset and submits every file to the parsing/vectorizing pipeline. Returns the job id; progress is polled via GET /knowledge-market/tasks/{job_id}. Conflicts with an in-flight install/update of the same item return 409.
+         * Enqueues the install job. Prebuilt items default to text chunks. An indexed request requires a valid confirmation value from the install preview and records the confirmed model and release for the job. Prebuilt jobs currently import text chunks. An empty body preserves the existing original-source install behavior. Poll progress at GET /knowledge-market/tasks/{job_id}.
          * @summary Install an official knowledge base
          * @param {KnowledgeMarketApiApiCoreKnowledgeMarketItemsMarketItemIdInstallPostRequest} requestParameters Request parameters.
          * @param {*} [options] Override http request option.
          * @throws {RequiredError}
          */
         apiCoreKnowledgeMarketItemsMarketItemIdInstallPost(requestParameters: KnowledgeMarketApiApiCoreKnowledgeMarketItemsMarketItemIdInstallPostRequest, options?: RawAxiosRequestConfig): AxiosPromise<KnowledgeMarketInstallOpenAPIResponse> {
-            return localVarFp.apiCoreKnowledgeMarketItemsMarketItemIdInstallPost(requestParameters.marketItemId, options).then((request) => request(axios, basePath));
+            return localVarFp.apiCoreKnowledgeMarketItemsMarketItemIdInstallPost(requestParameters.marketItemId, requestParameters.installRequest, options).then((request) => request(axios, basePath));
         },
         /**
-         * Enqueues a background update job (strategy A: clear old documents then import the new package). No-change updates finish with updated=false and write nothing. Conflicts with an in-flight install/update of the same item return 409; not-installed items return 404.
+         * Returns verified release counts and embedding model availability. If the model is ready, the response includes a short-lived confirmation value for this user, release, and model. Previewing has no installation side effects.
+         * @summary Preview installation of a prebuilt knowledge base
+         * @param {KnowledgeMarketApiApiCoreKnowledgeMarketItemsMarketItemIdInstallPreviewGetRequest} requestParameters Request parameters.
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        apiCoreKnowledgeMarketItemsMarketItemIdInstallPreviewGet(requestParameters: KnowledgeMarketApiApiCoreKnowledgeMarketItemsMarketItemIdInstallPreviewGetRequest, options?: RawAxiosRequestConfig): AxiosPromise<KnowledgeMarketInstallPreviewOpenAPIResponse> {
+            return localVarFp.apiCoreKnowledgeMarketItemsMarketItemIdInstallPreviewGet(requestParameters.marketItemId, options).then((request) => request(axios, basePath));
+        },
+        /**
+         * Enqueues a background update job. Original-source installations refresh their documents from the new package. Prebuilt installations support a release with one changed document and no additions or removals. The changed document is switched to the new text after successful import, and unchanged documents and their indexes are preserved. No-change updates finish with updated=false. An in-flight install or update of the same item returns 409. If the item is not installed, the request returns 404.
          * @summary Update one installed official knowledge base
          * @param {KnowledgeMarketApiApiCoreKnowledgeMarketItemsMarketItemIdUpdatePostRequest} requestParameters Request parameters.
          * @param {*} [options] Override http request option.
@@ -57713,6 +57896,16 @@ export const KnowledgeMarketApiFactory = function (configuration?: Configuration
          */
         apiCoreKnowledgeMarketItemsMarketItemIdUpdatePost(requestParameters: KnowledgeMarketApiApiCoreKnowledgeMarketItemsMarketItemIdUpdatePostRequest, options?: RawAxiosRequestConfig): AxiosPromise<KnowledgeMarketInstallOpenAPIResponse> {
             return localVarFp.apiCoreKnowledgeMarketItemsMarketItemIdUpdatePost(requestParameters.marketItemId, options).then((request) => request(axios, basePath));
+        },
+        /**
+         * Compares verified release manifests and reports changed source document IDs and the size of the required chunk objects. This read-only operation does not download chunk objects, enqueue tasks, or modify the installed knowledge base.
+         * @summary Preview changes to an installed prebuilt knowledge base
+         * @param {KnowledgeMarketApiApiCoreKnowledgeMarketItemsMarketItemIdUpdatePreviewGetRequest} requestParameters Request parameters.
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        apiCoreKnowledgeMarketItemsMarketItemIdUpdatePreviewGet(requestParameters: KnowledgeMarketApiApiCoreKnowledgeMarketItemsMarketItemIdUpdatePreviewGetRequest, options?: RawAxiosRequestConfig): AxiosPromise<KnowledgeMarketPrebuiltUpdatePreviewOpenAPIResponse> {
+            return localVarFp.apiCoreKnowledgeMarketItemsMarketItemIdUpdatePreviewGet(requestParameters.marketItemId, options).then((request) => request(axios, basePath));
         },
         /**
          * Returns the current user\'s knowledge market tasks (default job type knowledge_market_install; pass job_type for update/update-all) with market item info and install-state enrichment.
@@ -57765,8 +57958,8 @@ export const KnowledgeMarketApiFactory = function (configuration?: Configuration
             return localVarFp.apiCoreKnowledgeMarketTasksJobIdGet(requestParameters.jobId, options).then((request) => request(axios, basePath));
         },
         /**
-         * Enqueues new work for the current user\'s failed or partially failed task. Successful files are retained. Active or successful tasks return 409.
-         * @summary Retry a failed knowledge market task
+         * Retries failed file processing while retaining successful files. For an indexed prebuilt installation, resubmits only confirmed indexing failures or work that was never sent. The parent_job_id identifies the public task to follow. Recovering an already accepted receipt without submitting new work returns the original installation job_id with state succeeded. Active or ineligible work returns 409.
+         * @summary Retry knowledge market processing or indexing
          * @param {KnowledgeMarketApiApiCoreKnowledgeMarketTasksJobIdRetryPostRequest} requestParameters Request parameters.
          * @param {*} [options] Override http request option.
          * @throws {RequiredError}
@@ -57822,12 +58015,28 @@ export interface KnowledgeMarketApiApiCoreKnowledgeMarketItemsMarketItemIdGetReq
  */
 export interface KnowledgeMarketApiApiCoreKnowledgeMarketItemsMarketItemIdInstallPostRequest {
     readonly marketItemId: string
+
+    readonly installRequest?: InstallRequest
+}
+
+/**
+ * Request parameters for apiCoreKnowledgeMarketItemsMarketItemIdInstallPreviewGet operation in KnowledgeMarketApi.
+ */
+export interface KnowledgeMarketApiApiCoreKnowledgeMarketItemsMarketItemIdInstallPreviewGetRequest {
+    readonly marketItemId: string
 }
 
 /**
  * Request parameters for apiCoreKnowledgeMarketItemsMarketItemIdUpdatePost operation in KnowledgeMarketApi.
  */
 export interface KnowledgeMarketApiApiCoreKnowledgeMarketItemsMarketItemIdUpdatePostRequest {
+    readonly marketItemId: string
+}
+
+/**
+ * Request parameters for apiCoreKnowledgeMarketItemsMarketItemIdUpdatePreviewGet operation in KnowledgeMarketApi.
+ */
+export interface KnowledgeMarketApiApiCoreKnowledgeMarketItemsMarketItemIdUpdatePreviewGetRequest {
     readonly marketItemId: string
 }
 
@@ -57949,18 +58158,29 @@ export class KnowledgeMarketApi extends BaseAPI {
     }
 
     /**
-     * Enqueues a background install job that downloads the package, creates a personal dataset and submits every file to the parsing/vectorizing pipeline. Returns the job id; progress is polled via GET /knowledge-market/tasks/{job_id}. Conflicts with an in-flight install/update of the same item return 409.
+     * Enqueues the install job. Prebuilt items default to text chunks. An indexed request requires a valid confirmation value from the install preview and records the confirmed model and release for the job. Prebuilt jobs currently import text chunks. An empty body preserves the existing original-source install behavior. Poll progress at GET /knowledge-market/tasks/{job_id}.
      * @summary Install an official knowledge base
      * @param {KnowledgeMarketApiApiCoreKnowledgeMarketItemsMarketItemIdInstallPostRequest} requestParameters Request parameters.
      * @param {*} [options] Override http request option.
      * @throws {RequiredError}
      */
     public apiCoreKnowledgeMarketItemsMarketItemIdInstallPost(requestParameters: KnowledgeMarketApiApiCoreKnowledgeMarketItemsMarketItemIdInstallPostRequest, options?: RawAxiosRequestConfig) {
-        return KnowledgeMarketApiFp(this.configuration).apiCoreKnowledgeMarketItemsMarketItemIdInstallPost(requestParameters.marketItemId, options).then((request) => request(this.axios, this.basePath));
+        return KnowledgeMarketApiFp(this.configuration).apiCoreKnowledgeMarketItemsMarketItemIdInstallPost(requestParameters.marketItemId, requestParameters.installRequest, options).then((request) => request(this.axios, this.basePath));
     }
 
     /**
-     * Enqueues a background update job (strategy A: clear old documents then import the new package). No-change updates finish with updated=false and write nothing. Conflicts with an in-flight install/update of the same item return 409; not-installed items return 404.
+     * Returns verified release counts and embedding model availability. If the model is ready, the response includes a short-lived confirmation value for this user, release, and model. Previewing has no installation side effects.
+     * @summary Preview installation of a prebuilt knowledge base
+     * @param {KnowledgeMarketApiApiCoreKnowledgeMarketItemsMarketItemIdInstallPreviewGetRequest} requestParameters Request parameters.
+     * @param {*} [options] Override http request option.
+     * @throws {RequiredError}
+     */
+    public apiCoreKnowledgeMarketItemsMarketItemIdInstallPreviewGet(requestParameters: KnowledgeMarketApiApiCoreKnowledgeMarketItemsMarketItemIdInstallPreviewGetRequest, options?: RawAxiosRequestConfig) {
+        return KnowledgeMarketApiFp(this.configuration).apiCoreKnowledgeMarketItemsMarketItemIdInstallPreviewGet(requestParameters.marketItemId, options).then((request) => request(this.axios, this.basePath));
+    }
+
+    /**
+     * Enqueues a background update job. Original-source installations refresh their documents from the new package. Prebuilt installations support a release with one changed document and no additions or removals. The changed document is switched to the new text after successful import, and unchanged documents and their indexes are preserved. No-change updates finish with updated=false. An in-flight install or update of the same item returns 409. If the item is not installed, the request returns 404.
      * @summary Update one installed official knowledge base
      * @param {KnowledgeMarketApiApiCoreKnowledgeMarketItemsMarketItemIdUpdatePostRequest} requestParameters Request parameters.
      * @param {*} [options] Override http request option.
@@ -57968,6 +58188,17 @@ export class KnowledgeMarketApi extends BaseAPI {
      */
     public apiCoreKnowledgeMarketItemsMarketItemIdUpdatePost(requestParameters: KnowledgeMarketApiApiCoreKnowledgeMarketItemsMarketItemIdUpdatePostRequest, options?: RawAxiosRequestConfig) {
         return KnowledgeMarketApiFp(this.configuration).apiCoreKnowledgeMarketItemsMarketItemIdUpdatePost(requestParameters.marketItemId, options).then((request) => request(this.axios, this.basePath));
+    }
+
+    /**
+     * Compares verified release manifests and reports changed source document IDs and the size of the required chunk objects. This read-only operation does not download chunk objects, enqueue tasks, or modify the installed knowledge base.
+     * @summary Preview changes to an installed prebuilt knowledge base
+     * @param {KnowledgeMarketApiApiCoreKnowledgeMarketItemsMarketItemIdUpdatePreviewGetRequest} requestParameters Request parameters.
+     * @param {*} [options] Override http request option.
+     * @throws {RequiredError}
+     */
+    public apiCoreKnowledgeMarketItemsMarketItemIdUpdatePreviewGet(requestParameters: KnowledgeMarketApiApiCoreKnowledgeMarketItemsMarketItemIdUpdatePreviewGetRequest, options?: RawAxiosRequestConfig) {
+        return KnowledgeMarketApiFp(this.configuration).apiCoreKnowledgeMarketItemsMarketItemIdUpdatePreviewGet(requestParameters.marketItemId, options).then((request) => request(this.axios, this.basePath));
     }
 
     /**
@@ -58026,8 +58257,8 @@ export class KnowledgeMarketApi extends BaseAPI {
     }
 
     /**
-     * Enqueues new work for the current user\'s failed or partially failed task. Successful files are retained. Active or successful tasks return 409.
-     * @summary Retry a failed knowledge market task
+     * Retries failed file processing while retaining successful files. For an indexed prebuilt installation, resubmits only confirmed indexing failures or work that was never sent. The parent_job_id identifies the public task to follow. Recovering an already accepted receipt without submitting new work returns the original installation job_id with state succeeded. Active or ineligible work returns 409.
+     * @summary Retry knowledge market processing or indexing
      * @param {KnowledgeMarketApiApiCoreKnowledgeMarketTasksJobIdRetryPostRequest} requestParameters Request parameters.
      * @param {*} [options] Override http request option.
      * @throws {RequiredError}

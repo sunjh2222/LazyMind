@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"net/url"
 	"path/filepath"
@@ -401,6 +402,11 @@ func prepareSegmentRequest(w http.ResponseWriter, r *http.Request, handler strin
 		common.ReplyErr(w, fmt.Sprintf("%s: %v", "document not found", err), http.StatusNotFound)
 		return "", "", "", "", "", "", false
 	}
+	var ext documentExt
+	_ = json.Unmarshal(docRow.Ext, &ext)
+	if !requirePrebuiltDocumentReady(w, r, docRow, ext) {
+		return "", "", "", "", "", "", false
+	}
 	lazyDocID = strings.TrimSpace(docRow.LazyllmDocID)
 	algoID = parseDatasetAlgo(ds.Ext).AlgoID
 	group = resolveSegmentGroup(r, algoID, body)
@@ -683,7 +689,12 @@ func mapChunkToSegment(datasetID, documentID string, item map[string]any) Segmen
 	// Prefer durable normalized JPEG over volatile OCR cache (.image_cache) for display.
 	renderPath := firstAnyStringWithMeta(item, meta, "", "normalized_source_path")
 	if renderPath == "" {
-		renderPath = firstAnyStringWithMeta(item, meta, "", "source_path")
+		// source_path also carries document provenance for text chunks.
+		sourcePath := firstAnyStringWithMeta(item, meta, "", "source_path")
+		if segmentType == "SEGMENT_TYPE_IMAGE" || segmentType == "SEGMENT_TYPE_WEB_IMAGE" ||
+			strings.HasPrefix(mime.TypeByExtension(filepath.Ext(sourcePath)), "image/") {
+			renderPath = sourcePath
+		}
 	}
 	var displayContent string
 	if renderPath != "" {

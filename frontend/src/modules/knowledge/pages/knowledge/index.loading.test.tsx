@@ -1,6 +1,7 @@
 import {act, fireEvent, render, screen, waitFor} from '@testing-library/react';
 import {Link, MemoryRouter, Route, Routes} from 'react-router-dom';
 import {afterEach, expect, it, vi} from 'vitest';
+import {AxiosError} from 'axios';
 import {axiosInstance} from '@/components/request';
 import type {Dataset} from '@/api/generated/knowledge-client';
 import {useDatasetPermissionStore} from '@/modules/knowledge/store/dataset_permission';
@@ -22,9 +23,72 @@ it('does not render the legacy document layout while file metadata is unresolved
   expect(screen.getByRole('status')).toBeVisible();
 });
 
-function renderDocument() {
-  return render(<MemoryRouter initialEntries={['/doc/library/paper']}><Routes><Route path="/doc/:knowledgeBaseId/:knowledgeId" element={<Detail/>}/></Routes></MemoryRouter>);
+function renderDocument(path = '/doc/library/paper') {
+  return render(<MemoryRouter initialEntries={[path]}><Routes><Route path="/doc/:knowledgeBaseId/:knowledgeId" element={<Detail/>}/></Routes></MemoryRouter>);
 }
+
+it.each([
+  'group_name=block&segement_id=older-passage',
+  'segement_id=older-passage',
+])('keeps the current prebuilt document readable and explains a missing historical citation (%s)', async (query) => {
+  useDatasetPermissionStore.getState().setCurrentDataset({dataset_id: 'library', scene: 'general'} as Dataset);
+  const lookedUp = vi.fn();
+  axiosInstance.defaults.adapter = config => {
+    const path = new URL(config.url || '', window.location.origin).pathname;
+    if (path.endsWith('/documents/paper/segments/older-passage')) {
+      lookedUp();
+      return Promise.reject(new AxiosError('Segment not found', 'ERR_BAD_REQUEST', config, undefined, {
+        config, status: 404, statusText: 'Not Found', headers: {}, data: {message: 'segment not found'},
+      }));
+    }
+    if (path.endsWith('/documents/paper')) {
+      return Promise.resolve({config, status: 200, statusText: 'OK', headers: {}, data: {
+        display_name: 'current.md', file_url: '/static/current.md', prebuilt_source_path: 'paper.md',
+      }});
+    }
+    return new Promise(() => {});
+  };
+  renderDocument(`/doc/library/paper?${query}&from=chat`);
+  expect(await screen.findByTestId('file-viewer')).toHaveAttribute('data-filename', 'current.md');
+  await waitFor(() => expect(lookedUp).toHaveBeenCalledOnce());
+  expect(await screen.findByText(/无法定位原引用片段|Could not locate the original cited passage/)).toBeVisible();
+});
+
+it('keeps a valid citation selected when the previous lookup reports a late 404', async () => {
+  useDatasetPermissionStore.getState().setCurrentDataset({dataset_id: 'library', scene: 'general'} as Dataset);
+  let rejectOldCitation: (() => void) | undefined;
+  axiosInstance.defaults.adapter = config => {
+    const path = new URL(config.url || '', window.location.origin).pathname;
+    if (path.endsWith('/documents/paper/segments/older-passage')) {
+      return new Promise((_resolve, reject) => {
+        rejectOldCitation = () => reject(new AxiosError('Segment not found', 'ERR_BAD_REQUEST', config, undefined, {
+          config, status: 404, statusText: 'Not Found', headers: {}, data: {message: 'segment not found'},
+        }));
+      });
+    }
+    if (path.endsWith('/documents/paper/segments/current-passage')) {
+      return Promise.resolve({config, status: 200, statusText: 'OK', headers: {}, data: {segment_id: 'current-passage'}});
+    }
+    if (path.endsWith('/documents/paper')) {
+      return Promise.resolve({config, status: 200, statusText: 'OK', headers: {}, data: {
+        display_name: 'current.md', file_url: '/static/current.md', prebuilt_source_path: 'paper.md',
+      }});
+    }
+    return new Promise(() => {});
+  };
+  render(
+    <MemoryRouter initialEntries={['/doc/library/paper?group_name=block&segement_id=older-passage']}>
+      <Link to="/doc/library/paper?group_name=block&segement_id=current-passage">Open current citation</Link>
+      <Routes><Route path="/doc/:knowledgeBaseId/:knowledgeId" element={<Detail/>}/></Routes>
+    </MemoryRouter>,
+  );
+  await waitFor(() => expect(rejectOldCitation).toBeTypeOf('function'));
+  fireEvent.click(screen.getByRole('link', {name: 'Open current citation'}));
+  await waitFor(() => expect(surfaces.viewer.segment).toMatchObject({segment_id: 'current-passage'}));
+  await act(async () => rejectOldCitation?.());
+  expect(screen.queryByText(/无法定位原引用片段|Could not locate the original cited passage/)).not.toBeInTheDocument();
+  expect(surfaces.viewer.segment).toMatchObject({segment_id: 'current-passage'});
+});
 
 it('switches from the loading surface directly into the PDF workspace', async () => {
   useDatasetPermissionStore.getState().setCurrentDataset({dataset_id:'library',scene:'academic_papers'} as Dataset);

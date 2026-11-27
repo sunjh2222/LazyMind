@@ -452,13 +452,23 @@ def build_source_node_from_item(index: Any, item: dict[str, Any]) -> dict[str, A
     global_md = item.get('global_metadata') if isinstance(item.get('global_metadata'), dict) else {}
     content = item.get('text') if item.get('text') is not None else item.get('content', '')
     document_index, chunk_index = split_citation_index(index)
+    document_id = item.get('docid') or item.get('document_id') or global_md.get('docid', '')
+    dataset_id = item.get('kb_id') or item.get('dataset_id') or global_md.get('kb_id', '')
+    core_document_id = global_md.get('core_document_id')
+    # Citation links use the stable Core identity supplied with versioned imports.
+    if (isinstance(document_id, str) and document_id.startswith('prebuiltv_')
+            and isinstance(core_document_id, str) and core_document_id.strip()):
+        document_id = core_document_id.strip()
+        core_dataset_id = global_md.get('dataset_id')
+        if isinstance(core_dataset_id, str) and core_dataset_id.strip():
+            dataset_id = core_dataset_id.strip()
     source = {
         'source_type': 'knowledge_base',
         'file_id': '',
         'file_name': file_name_from_item(item),
-        'document_id': item.get('docid') or item.get('document_id') or global_md.get('docid', ''),
+        'document_id': document_id,
         'segement_id': item.get('uid') or item.get('segement_id') or '',
-        'dataset_id': item.get('kb_id') or item.get('dataset_id') or global_md.get('kb_id', ''),
+        'dataset_id': dataset_id,
         'index': index,
         'display_index': item.get('display_index') or document_index or index,
         'document_index': item.get('document_index') or document_index or index,

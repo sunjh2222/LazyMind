@@ -36,6 +36,7 @@ type catalogItem struct {
 	VersionNote     string         `yaml:"version_note"`
 	PackageURL      string         `yaml:"package_url"`
 	PackageRevision string         `yaml:"package_revision"`
+	PrebuiltRelease string         `yaml:"prebuilt_release_url"`
 	OnlineAccessURL string         `yaml:"online_access_url"`
 	DataSource      string         `yaml:"data_source"`
 	SourceAdapter   string         `yaml:"source_adapter"`
@@ -126,6 +127,18 @@ func upsertItem(tx *gorm.DB, now time.Time, sortOrder int, item catalogItem) err
 	}
 	if string(questionsJSON) == "null" {
 		questionsJSON = []byte("[]")
+	}
+	if _, reserved := item.SourceOptions[prebuiltReleaseOption]; reserved {
+		return fmt.Errorf("knowledge market catalog item %q must set prebuilt_release_url at the item level", item.ID)
+	}
+	if release := strings.TrimSpace(item.PrebuiltRelease); release != "" {
+		if _, err := prebuiltReleaseBase(release); err != nil {
+			return fmt.Errorf("knowledge market catalog item %q: %w", item.ID, err)
+		}
+		if item.SourceOptions == nil {
+			item.SourceOptions = make(map[string]any)
+		}
+		item.SourceOptions[prebuiltReleaseOption] = release
 	}
 	optionsJSON, err := json.Marshal(item.SourceOptions)
 	if err != nil {

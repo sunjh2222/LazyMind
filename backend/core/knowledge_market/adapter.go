@@ -71,6 +71,7 @@ func decodeSourceOptions(raw json.RawMessage) (source.Options, error) {
 	if err := json.Unmarshal(raw, &values); err != nil {
 		return nil, err
 	}
+	delete(values, prebuiltReleaseOption)
 	return source.Options(values), nil
 }
 

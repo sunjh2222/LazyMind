@@ -1,0 +1,89 @@
+name: Knowledge Market Upstream Prebuilt
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the configured public dataset from the default branch
+        type: boolean
+        default: false
+  schedule:
+    # 03:17 China Standard Time. Scheduled publishing requires explicit opt-in.
+    - cron: '17 19 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: knowledge-market-prebuilt-${{ vars.LAZYMIND_MARKET_PREBUILT_UPSTREAM_TARGET_REPO }}-${{ vars.LAZYMIND_MARKET_PREBUILT_UPSTREAM_TARGET_PREFIX }}
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_PROVIDER: ${{ vars.LAZYMIND_MARKET_PREBUILT_UPSTREAM_PROVIDER }}
+  UPSTREAM_REPO: ${{ vars.LAZYMIND_MARKET_PREBUILT_UPSTREAM_REPO }}
+  UPSTREAM_REF: ${{ vars.LAZYMIND_MARKET_PREBUILT_UPSTREAM_REF }}
+  UPSTREAM_DIR: ${{ vars.LAZYMIND_MARKET_PREBUILT_UPSTREAM_DIR }}
+  ITEM_ID: ${{ vars.LAZYMIND_MARKET_PREBUILT_UPSTREAM_ITEM_ID }}
+  TARGET_REPO: ${{ vars.LAZYMIND_MARKET_PREBUILT_UPSTREAM_TARGET_REPO }}
+  TARGET_PREFIX: ${{ vars.LAZYMIND_MARKET_PREBUILT_UPSTREAM_TARGET_PREFIX }}
+  GIT_TERMINAL_PROMPT: '0'
+  PYTHONPATH: ${{ github.workspace }}/algorithm
+  CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+
+jobs:
+  dry-run:
+    if: github.event_name == 'workflow_dispatch' && !inputs.publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install the checked-out algorithm runtime
+        run: |
+          python -m pip install ./algorithm/lazyllm -r algorithm/requirements.txt
+          python -c "from importlib.util import find_spec; from pathlib import Path; from shutil import copy2; copy2('algorithm/lazyllm/pyproject.toml', Path(find_spec('lazyllm').origin).parent / 'pyproject.toml')"
+      - name: Build the registered dataset without publishing
+        run: |
+          python scripts/publish_market_prebuilt.py \
+            --upstream-provider "$UPSTREAM_PROVIDER" --upstream-repo "$UPSTREAM_REPO" \
+            --upstream-ref "$UPSTREAM_REF" --upstream-dir "$UPSTREAM_DIR" --item-id "$ITEM_ID" \
+            --repo "$TARGET_REPO" --prefix "$TARGET_PREFIX" \
+            --output-dir "$RUNNER_TEMP/knowledge-market-prebuilt"
+
+  publish:
+    if: >-
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
+      ((github.event_name == 'workflow_dispatch' && inputs.publish) ||
+       (github.event_name == 'schedule' && vars.LAZYMIND_MARKET_PREBUILT_UPSTREAM_SCHEDULE == 'true'))
+    environment: knowledge-market-prebuilt-upstream
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install the checked-out algorithm runtime
+        run: |
+          python -m pip install ./algorithm/lazyllm -r algorithm/requirements.txt
+          python -c "from importlib.util import find_spec; from pathlib import Path; from shutil import copy2; copy2('algorithm/lazyllm/pyproject.toml', Path(find_spec('lazyllm').origin).parent / 'pyproject.toml')"
+      - name: Publish and verify a changed dataset
+        env:
+          MODELSCOPE_API_TOKEN: ${{ secrets.MODELSCOPE_API_TOKEN }}
+        run: |
+          if [[ -z "$MODELSCOPE_API_TOKEN" ]]; then
+            echo '::error::Set MODELSCOPE_API_TOKEN in the knowledge-market-prebuilt-upstream environment.'
+            exit 1
+          fi
+          python scripts/publish_market_prebuilt.py \
+            --upstream-provider "$UPSTREAM_PROVIDER" --upstream-repo "$UPSTREAM_REPO" \
+            --upstream-ref "$UPSTREAM_REF" --upstream-dir "$UPSTREAM_DIR" --item-id "$ITEM_ID" \
+            --repo "$TARGET_REPO" --prefix "$TARGET_PREFIX" --publish

@@ -3,8 +3,7 @@ import { Button, Empty, Modal, Popconfirm, Progress, Table, Typography, message 
 import { MinusOutlined, PlusOutlined } from "@ant-design/icons";
 import type { ColumnsType } from "antd/es/table";
 import { useTranslation } from "react-i18next";
-import type { KnowledgeMarketTaskListItemOpenAPIResponse } from "@/api/generated/core-client";
-import { cancelKnowledgeMarketTask, deleteKnowledgeMarketTask, retryKnowledgeMarketTask } from "@/modules/knowledge/api/knowledgeMarket";
+import { cancelKnowledgeMarketTask, deleteKnowledgeMarketTask, retryKnowledgeMarketTask, type KnowledgeMarketTaskListItem } from "@/modules/knowledge/api/knowledgeMarket";
 import type { KnowledgeMarketTasksQuery } from "./useKnowledgeMarketTasks";
 import { getKnowledgeMarketTaskPercent, isKnowledgeMarketTaskCompleted, isKnowledgeMarketTaskFailed, isKnowledgeMarketTaskPartiallyFailed } from "./knowledgeMarketTaskState";
 import KnowledgeMarketTaskFiles from "./KnowledgeMarketTaskFiles";
@@ -13,13 +12,13 @@ import "./KnowledgeMarketTaskModal.scss";
 import ProcessingTaskPanel from "./ProcessingTaskPanel";
 import type { ProcessingTasksQuery } from "./useProcessingTasks";
 
-type TaskRow = KnowledgeMarketTaskListItemOpenAPIResponse;
+type TaskRow = KnowledgeMarketTaskListItem;
 interface KnowledgeMarketTaskModalProps {
   open: boolean;
   processingQuery?: ProcessingTasksQuery;
   query: KnowledgeMarketTasksQuery;
   onClose: () => void;
-  onTasksChanged: (retriedTask?: { name: string }) => void;
+  onTasksChanged: (retriedTask?: { name: string; index?: boolean }) => void;
 }
 function toTaskState(task: TaskRow) {
   return { jobType: task.job_type, jobStatus: task.job_status, stage: task.stage, overallPercent: task.overall_percent, progress: task.progress, displayState: task.display_state };
@@ -97,9 +96,19 @@ export default function KnowledgeMarketTaskModal({ open, query, processingQuery,
       } else if (action === "retry") {
         const next = await retryKnowledgeMarketTask(task.job_id);
         if (!isCurrent()) return;
-        followJob.current = next.job_id;
-        setExpanded(undefined);
-        setPage(1);
+        if (next.job_id === task.job_id && next.state === "succeeded") {
+          onTasksChanged();
+          return;
+        }
+        const indexRetry = displayState(task) === "done" && ["failed", "partial_failed", "unknown"].includes(task.index_progress?.state || "");
+        const parentJobId = next.parent_job_id || (indexRetry ? task.job_id : undefined);
+        followJob.current = parentJobId || next.job_id;
+        if (!parentJobId) {
+          setExpanded(undefined);
+          setPage(1);
+        }
+        onTasksChanged({ name: task.name || t("knowledge.taskTypeUpdateAll"), index: Boolean(parentJobId) });
+        return;
       } else {
         const result = await cancelKnowledgeMarketTask(task.job_id);
         if (!isCurrent()) return;
@@ -107,7 +116,7 @@ export default function KnowledgeMarketTaskModal({ open, query, processingQuery,
       }
       if (!isCurrent()) return;
       if (action === "delete") void messageApi.success(t("knowledge.taskDeleteSuccess"));
-      onTasksChanged(action === "retry" ? { name: task.name || t("knowledge.taskTypeUpdateAll") } : undefined);
+      onTasksChanged();
     } catch {
       if (isCurrent()) void messageApi.warning(t(action === "cancel" ? "knowledge.taskCancelUnavailable" : "knowledge.taskActionFailed"));
     } finally {
@@ -127,7 +136,20 @@ export default function KnowledgeMarketTaskModal({ open, query, processingQuery,
       const state = displayState(task);
       const percent = Math.min(100, Math.max(0, getKnowledgeMarketTaskPercent(toTaskState(task))));
       const color = state === "failed" ? "#f54a45" : ["partial_failed", "partial_canceled", "blocked"].includes(state) ? "#faad14" : ["unknown", "canceled"].includes(state) ? "#8f959e" : "#1677ff";
-      return <div className="market-task-progress"><Progress percent={percent} showInfo={false} size="small" strokeColor={color} /><span>{percent}%</span></div>;
+      const index = task.index_progress;
+      return <div>
+        {index && <Typography.Text className="market-task-progress-label" type="secondary">{t("knowledge.marketTextProgress")}</Typography.Text>}
+        <div className="market-task-progress"><Progress percent={percent} showInfo={false} size="small" strokeColor={color} /><span>{percent}%</span></div>
+        {index && <div className="market-task-index-progress">
+          <Typography.Text className="market-task-progress-label" type={index.state === "failed" && !queryFailed ? "danger" : "secondary"}>
+            {t(`knowledge.marketIndexState_${queryFailed ? "unknown" : index.state}`)}
+          </Typography.Text>
+          {!queryFailed && <Typography.Text className="market-task-progress-label" type="secondary">
+            {t("knowledge.marketIndexProgress", { done: index.done, total: index.total })}
+            {index.failed > 0 && ` · ${t("knowledge.marketIndexFailures", { count: index.failed })}`}
+          </Typography.Text>}
+        </div>}
+      </div>;
     } },
     { title: t("knowledge.taskCreatedAt"), dataIndex: "created_at", width: 184, render: (value: string) => value ? new Date(value).toLocaleString() : "-" },
     { title: t("common.actions"), width: 210, align: "center", render: (_, task) => <div className="market-task-actions">

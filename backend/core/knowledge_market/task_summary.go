@@ -9,8 +9,8 @@ import (
 	"lazymind/core/doc"
 )
 
-// Count the same nonterminal states as task rows, independently of pagination
-// and filters. A successful import can still have unfinished parse work.
+// Count outstanding work independently of pagination and filters.
+// A successful import can still have unfinished parse or index work.
 func unfinishedMarketTaskCount(r *http.Request, db *gorm.DB, userID string) (int, error) {
 	var jobs []orm.AsyncJob
 	if err := db.WithContext(r.Context()).Where("create_user_id = ? AND job_type IN ?", userID, marketJobTypes).
@@ -29,6 +29,10 @@ func unfinishedMarketTaskCount(r *http.Request, db *gorm.DB, userID string) (int
 	if err != nil {
 		return 0, err
 	}
+	index, err := loadInstallIndexProgress(r.Context(), db, userID, jobs, installs)
+	if err != nil {
+		return 0, err
+	}
 	type liveTask struct {
 		job orm.AsyncJob
 		cfg installConfig
@@ -38,7 +42,9 @@ func unfinishedMarketTaskCount(r *http.Request, db *gorm.DB, userID string) (int
 	for _, job := range jobs {
 		install, snapshot := taskProgressSource(job, installs[job.ResourceID], func() bool { return latest[job.ResourceID] == job.ID })
 		if snapshot != nil {
-			if !marketTaskTerminal(marketDisplay(job, *snapshot)) {
+			// Only a replay freezes an unknown parse state. Its successor
+			// owns the remaining work even if that job is later removed.
+			if index[job.ID].active() || (snapshot.State != "unknown" && !marketTaskTerminal(marketDisplay(job, *snapshot))) {
 				count++
 			}
 			continue
@@ -64,7 +70,7 @@ func unfinishedMarketTaskCount(r *http.Request, db *gorm.DB, userID string) (int
 		}
 		for _, task := range tasks {
 			parse := doc.MarketParseProgressFromStates(task.cfg.TaskIDs, task.cfg.Failures, files)
-			if !marketTaskTerminal(marketDisplay(task.job, parse)) {
+			if index[task.job.ID].active() || !marketTaskTerminal(marketDisplay(task.job, parse)) {
 				count++
 			}
 		}

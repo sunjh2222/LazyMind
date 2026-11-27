@@ -15,6 +15,7 @@ import (
 	"lazymind/core/datasource"
 	"lazymind/core/doc"
 	"lazymind/core/evalset"
+	"lazymind/core/knowledge_market"
 	"lazymind/core/mcp"
 	"lazymind/core/modelconfig"
 	"lazymind/core/modelprovider"
@@ -2511,8 +2512,21 @@ type knowledgeMarketDomainsOpenAPIResponse struct {
 }
 
 type knowledgeMarketInstallOpenAPIResponse struct {
-	JobID string `json:"job_id"`
-	State string `json:"state"`
+	JobID       string `json:"job_id"`
+	State       string `json:"state"`
+	ParentJobID string `json:"parent_job_id,omitempty" desc:"Public installation task to follow for an index retry. The job_id can identify an internal index job."`
+}
+
+type knowledgeMarketInstallPreviewOpenAPIResponse struct {
+	Code    int                             `json:"code"`
+	Message string                          `json:"message"`
+	Data    knowledge_market.InstallPreview `json:"data"`
+}
+
+type knowledgeMarketPrebuiltUpdatePreviewOpenAPIResponse struct {
+	Code    int                                    `json:"code"`
+	Message string                                 `json:"message"`
+	Data    knowledge_market.PrebuiltUpdatePreview `json:"data"`
 }
 
 type knowledgeMarketTaskPathParams struct {
@@ -2580,6 +2594,7 @@ type knowledgeMarketTaskProgressOpenAPIResponse struct {
 }
 
 type knowledgeMarketTaskListItemOpenAPIResponse struct {
+	IndexProgress  *knowledge_market.InstallIndexProgress   `json:"index_progress,omitempty"`
 	DatasetDeleted bool                                     `json:"dataset_deleted,omitempty"`
 	Parse          *knowledgeMarketTaskParseOpenAPIResponse `json:"parse,omitempty"`
 	DisplayState   string                                   `json:"display_state,omitempty"`
@@ -2653,10 +2668,11 @@ type knowledgeMarketFileFailureOpenAPIResponse struct {
 }
 
 type knowledgeMarketTaskDetailOpenAPIResponse struct {
-	DisplayState string `json:"display_state,omitempty"`
-	CanCancel    bool   `json:"can_cancel,omitempty"`
-	CanRetry     bool   `json:"can_retry,omitempty"`
-	CanDelete    bool   `json:"can_delete,omitempty"`
+	IndexProgress *knowledge_market.InstallIndexProgress `json:"index_progress,omitempty"`
+	DisplayState  string                                 `json:"display_state,omitempty"`
+	CanCancel     bool                                   `json:"can_cancel,omitempty"`
+	CanRetry      bool                                   `json:"can_retry,omitempty"`
+	CanDelete     bool                                   `json:"can_delete,omitempty"`
 
 	JobID          string                                     `json:"job_id"`
 	JobType        string                                     `json:"job_type"`
@@ -4385,19 +4401,56 @@ func registeredCoreOperations() []openAPIOperation {
 			Responses:   map[int]openAPIResponse{200: resp("Knowledge market item", knowledgeMarketDetailOpenAPIResponse{})},
 		},
 		{
+			Method:      "GET",
+			Path:        "/knowledge-market/items/{market_item_id}/install-preview",
+			Summary:     "Preview installation of a prebuilt knowledge base",
+			Description: "Returns verified release counts and embedding model availability. If the model is ready, the response includes a short-lived confirmation value for this user, release, and model. Previewing has no installation side effects.",
+			Tags:        []string{"knowledge-market"},
+			PathParams:  knowledgeMarketItemPathParams{},
+			Responses: map[int]openAPIResponse{
+				200: resp("Prebuilt knowledge market installation preview", knowledgeMarketInstallPreviewOpenAPIResponse{}),
+				400: refResp("User or market item ID is missing", "ErrorResponse"),
+				404: refResp("Published market item not found or prebuilt preview is unavailable", "ErrorResponse"),
+				502: refResp("Release metadata is invalid or unavailable", "ErrorResponse"),
+			},
+		},
+		{
+			Method:      "GET",
+			Path:        "/knowledge-market/items/{market_item_id}/update-preview",
+			Summary:     "Preview changes to an installed prebuilt knowledge base",
+			Description: "Compares verified release manifests and reports changed source document IDs and the size of the required chunk objects. This read-only operation does not download chunk objects, enqueue tasks, or modify the installed knowledge base.",
+			Tags:        []string{"knowledge-market"},
+			PathParams:  knowledgeMarketItemPathParams{},
+			Responses: map[int]openAPIResponse{
+				200: resp("Prebuilt knowledge market update preview", knowledgeMarketPrebuiltUpdatePreviewOpenAPIResponse{}),
+				400: refResp("User or market item ID is missing", "ErrorResponse"),
+				403: refResp("Dataset access denied", "ErrorResponse"),
+				404: refResp("Published or installed knowledge base not found", "ErrorResponse"),
+				409: refResp("Prebuilt installation is not eligible for preview or its release source changed", "ErrorResponse"),
+				502: refResp("Release metadata is invalid or unavailable", "ErrorResponse"),
+			},
+		},
+		{
 			Method:      "POST",
 			Path:        "/knowledge-market/items/{market_item_id}:install",
 			Summary:     "Install an official knowledge base",
-			Description: "Enqueues a background install job that downloads the package, creates a personal dataset and submits every file to the parsing/vectorizing pipeline. Returns the job id; progress is polled via GET /knowledge-market/tasks/{job_id}. Conflicts with an in-flight install/update of the same item return 409.",
+			Description: "Enqueues the install job. Prebuilt items default to text chunks. An indexed request requires a valid confirmation value from the install preview and records the confirmed model and release for the job. Prebuilt jobs currently import text chunks. An empty body preserves the existing original-source install behavior. Poll progress at GET /knowledge-market/tasks/{job_id}.",
 			Tags:        []string{"knowledge-market"},
 			PathParams:  knowledgeMarketItemPathParams{},
-			Responses:   map[int]openAPIResponse{200: resp("Install job enqueued", knowledgeMarketInstallOpenAPIResponse{})},
+			RequestBody: jsonBodyOf(knowledge_market.InstallRequest{}, false),
+			Responses: map[int]openAPIResponse{
+				200: resp("Install job enqueued", knowledgeMarketInstallOpenAPIResponse{}),
+				400: refResp("Invalid install request or missing confirmation", "ErrorResponse"),
+				404: refResp("Published market item not found", "ErrorResponse"),
+				409: refResp("Install conflict or confirmation must be renewed", "ErrorResponse"),
+				502: refResp("Release metadata is invalid or unavailable", "ErrorResponse"),
+			},
 		},
 		{
 			Method:      "POST",
 			Path:        "/knowledge-market/items/{market_item_id}:update",
 			Summary:     "Update one installed official knowledge base",
-			Description: "Enqueues a background update job (strategy A: clear old documents then import the new package). No-change updates finish with updated=false and write nothing. Conflicts with an in-flight install/update of the same item return 409; not-installed items return 404.",
+			Description: "Enqueues a background update job. Original-source installations refresh their documents from the new package. Prebuilt installations support a release with one changed document and no additions or removals. The changed document is switched to the new text after successful import, and unchanged documents and their indexes are preserved. No-change updates finish with updated=false. An in-flight install or update of the same item returns 409. If the item is not installed, the request returns 404.",
 			Tags:        []string{"knowledge-market"},
 			PathParams:  knowledgeMarketItemPathParams{},
 			Responses:   map[int]openAPIResponse{200: resp("Update job enqueued", knowledgeMarketInstallOpenAPIResponse{})},
@@ -4447,11 +4500,14 @@ func registeredCoreOperations() []openAPIOperation {
 		{
 			Method:      "POST",
 			Path:        "/knowledge-market/tasks/{job_id}:retry",
-			Summary:     "Retry a failed knowledge market task",
-			Description: "Enqueues new work for the current user's failed or partially failed task. Successful files are retained. Active or successful tasks return 409.",
+			Summary:     "Retry knowledge market processing or indexing",
+			Description: "Retries failed file processing while retaining successful files. For an indexed prebuilt installation, resubmits only confirmed indexing failures or work that was never sent. The parent_job_id identifies the public task to follow. Recovering an already accepted receipt without submitting new work returns the original installation job_id with state succeeded. Active or ineligible work returns 409.",
 			Tags:        []string{"knowledge-market"},
 			PathParams:  knowledgeMarketTaskPathParams{},
-			Responses:   map[int]openAPIResponse{200: resp("Retry enqueued", knowledgeMarketInstallOpenAPIResponse{})},
+			Responses: map[int]openAPIResponse{
+				200: resp("Retry accepted or an original receipt recovered", knowledgeMarketInstallOpenAPIResponse{}),
+				409: refResp("Active or ineligible work", "ErrorResponse"),
+			},
 		},
 
 		{

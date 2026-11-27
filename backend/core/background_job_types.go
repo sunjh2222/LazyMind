@@ -11,7 +11,7 @@ import (
 func defaultAsyncJobExcludedTypes(ragActive bool) []string {
 	excludedJobs := append([]string{doc.ReadingPreparationJob, vocabulary.CloudSyncJobType, documentdirectory.PlanJob, documentdirectory.OrganizeJob, academic.ChatLaunchJobType, academic.PreparationJobType}, chat.ConversationTitleJobTypes...)
 	if !ragActive {
-		excludedJobs = append(excludedJobs, doc.MarketInstallJobType, doc.MarketUpdateJobType, doc.MarketUpdateAllJobType)
+		excludedJobs = append(excludedJobs, doc.MarketInstallJobType, doc.MarketUpdateJobType, doc.MarketUpdateAllJobType, doc.MarketIndexJobType)
 	}
 	return excludedJobs
 }

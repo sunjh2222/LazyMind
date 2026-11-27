@@ -159,6 +159,11 @@ func MarketGetInstallTask(w http.ResponseWriter, r *http.Request) {
 		replyServiceError(w, err)
 		return
 	}
+	index, err := loadInstallIndexProgress(r.Context(), db, userID, []orm.AsyncJob{job}, map[string]*orm.KnowledgeMarketInstall{job.ResourceID: install})
+	if err != nil {
+		replyServiceError(w, err)
+		return
+	}
 	effectiveInstall, parse := taskProgress(r, db, job, install)
 	stage, overall := installStageAndPercent(job, effectiveInstall, parse)
 	data := taskItemDTO(job, item, effectiveInstall)
@@ -171,7 +176,7 @@ func MarketGetInstallTask(w http.ResponseWriter, r *http.Request) {
 	data["stage"] = stage
 	data["overall_percent"] = overall
 	data["parse"] = parse
-	addMarketControl(r, db, data, job, parse)
+	addMarketControl(r, db, data, job, install, parse, index[job.ID])
 	common.ReplyOK(w, data)
 }
 
@@ -221,7 +226,10 @@ func MarketListInstalls(w http.ResponseWriter, r *http.Request) {
 		parse := parseProgress(r, db, &rows[i])
 		effective := installWithEffectiveState(&rows[i], parse)
 		installByItem[rows[i].MarketItemID] = effective
-		parseActiveByItem[rows[i].MarketItemID] = effective != nil && effective.InstallState == string(orm.InstallStateVectorizing)
+		parseActiveByItem[rows[i].MarketItemID] = effective != nil &&
+			(effective.InstallState == string(orm.InstallStateVectorizing) ||
+				(effective.InstallState == string(orm.InstallStateImporting) && parseIsActive(parse) &&
+					decodeInstallConfig(effective).Prebuilt != nil))
 	}
 	activeByItem := make(map[string]bool, len(activeJobs))
 	for i := range activeJobs {
@@ -312,6 +320,10 @@ func buildTaskListItems(r *http.Request, db *gorm.DB, userID string, jobs []orm.
 	if err != nil {
 		return nil, err
 	}
+	index, err := loadInstallIndexProgress(r.Context(), db, userID, jobs, installByItem)
+	if err != nil {
+		return nil, err
+	}
 	datasetIDs := make([]string, 0, len(jobs))
 	for i := range jobs {
 		install := installByItem[jobs[i].ResourceID]
@@ -319,7 +331,7 @@ func buildTaskListItems(r *http.Request, db *gorm.DB, userID string, jobs []orm.
 		item := taskItemDTO(jobs[i], itemByID[jobs[i].ResourceID], effectiveInstall)
 		item["stage"], item["overall_percent"] = installStageAndPercent(jobs[i], effectiveInstall, parse)
 		item["parse"] = parse
-		addMarketControl(r, db, item, jobs[i], parse)
+		addMarketControl(r, db, item, jobs[i], install, parse, index[jobs[i].ID])
 		if id, _ := item["dataset_id"].(string); id != "" {
 			datasetIDs = append(datasetIDs, id)
 		}
@@ -407,7 +419,13 @@ func taskProgressSource(job orm.AsyncJob, current *orm.KnowledgeMarketInstall, l
 		return nil, &parseProgressInfo{State: "pending"}
 	}
 	if len(result.TaskIDs) > 0 || len(result.Failures) > 0 {
-		cfg, _ := json.Marshal(installConfig{TaskIDs: result.TaskIDs, Failures: result.Failures})
+		var payload installJobPayload
+		_ = json.Unmarshal(job.PayloadJSON, &payload)
+		release := payload.Prebuilt
+		if release == nil && current != nil && current.DatasetID == result.DatasetID {
+			release = decodeInstallConfig(current).Prebuilt
+		}
+		cfg, _ := json.Marshal(installConfig{TaskIDs: result.TaskIDs, Failures: result.Failures, Prebuilt: release})
 		own := &orm.KnowledgeMarketInstall{DatasetID: result.DatasetID, InstallState: "done", Config: cfg}
 		return own, nil
 	}
@@ -545,7 +563,11 @@ func installWithEffectiveState(install *orm.KnowledgeMarketInstall, parse parseP
 	}
 	switch parse.State {
 	case "parsing", "pending", "unknown":
-		copy.InstallState = string(orm.InstallStateVectorizing)
+		if decodeInstallConfig(install).Prebuilt != nil {
+			copy.InstallState = string(orm.InstallStateImporting)
+		} else {
+			copy.InstallState = string(orm.InstallStateVectorizing)
+		}
 	case "partial_failed":
 		copy.InstallState = string(orm.InstallStatePartialFailed)
 	case "failed":
@@ -566,6 +588,9 @@ func installStageAndPercent(job orm.AsyncJob, install *orm.KnowledgeMarketInstal
 		return "pending", 0
 	}
 	phase := phaseStage(install, job, parse)
+	if (job.Status == "running" || job.Status == "succeeded") && parseIsActive(parse) && decodeInstallConfig(install).Prebuilt != nil {
+		return "importing", overallPercent("parsing", job, parse)
+	}
 	if job.Status == "succeeded" && parse.Total > 0 {
 		return parse.State, overallPercent(parse.State, job, parse)
 	}

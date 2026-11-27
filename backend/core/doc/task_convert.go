@@ -654,7 +654,7 @@ func cloneDocumentExt(d documentExt) documentExt {
 
 func buildAddFileItem(datasetID string, taskRow orm.Task, docRow orm.Document, dExt documentExt, parsePath string) addFileItem {
 	externalPath := strings.TrimSpace(parsePath)
-	return addFileItem{FilePath: externalPath, DocID: firstNonEmpty(strings.TrimSpace(docRow.LazyllmDocID), docRow.ID), Metadata: map[string]any{
+	item := addFileItem{FilePath: externalPath, DocID: firstNonEmpty(strings.TrimSpace(docRow.LazyllmDocID), docRow.ID), Metadata: map[string]any{
 		"dataset_id":                 datasetID,
 		"document_pid":               docRow.PID,
 		"display_name":               docRow.DisplayName,
@@ -668,6 +668,14 @@ func buildAddFileItem(datasetID string, taskRow orm.Task, docRow orm.Document, d
 		"core_convert_status":        dExt.ConvertStatus,
 		"external_file_path":         externalPath,
 	}}
+	if dExt.PrebuiltPath != "" {
+		item.Metadata["prebuilt_path"] = dExt.PrebuiltPath
+		item.Metadata["source_path"] = dExt.PrebuiltSourcePath
+		if dExt.PrebuiltSourceURL != "" {
+			item.Metadata["source_url"] = dExt.PrebuiltSourceURL
+		}
+	}
+	return item
 }
 
 func marshalConvertMeta(d documentExt) string {
