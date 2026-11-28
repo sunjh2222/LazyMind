@@ -9,8 +9,10 @@ import (
 	"github.com/mesotron7x/LazyMind/local/local-runtime-manager/internal/desktopupdate"
 )
 
+var resolveLauncherUpdaterRoot = desktopupdate.UpdaterRoot
+
 func checkPendingDesktopUpdate(launcherPath string) error {
-	root, err := desktopupdate.UpdaterRoot()
+	root, err := resolveLauncherUpdaterRoot()
 	if err != nil {
 		return err
 	}

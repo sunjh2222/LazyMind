@@ -17,6 +17,8 @@ on:
         required: false
       WIN_CSC_KEY_PASSWORD:
         required: false
+      WINDOWS_POLICY_UPDATE_PRIVATE_KEY:
+        required: false
       HF_TOKEN:
         description: "Hugging Face dataset write token for installer mirrors"
         required: false
@@ -77,7 +79,7 @@ env:
 jobs:
   publish_windows_update:
     name: Publish signed Windows update
-    if: github.event_name == 'workflow_dispatch' && inputs.enable_updates && !inputs.enable_test_signed_updates && vars.LAZYMIND_DESKTOP_UPDATE_PUBLICATION_ENABLED == 'true'
+    if: github.event_name == 'workflow_dispatch' && inputs.enable_updates && !inputs.enable_test_signed_updates && fromJSON(vars.LAZYMIND_WINDOWS_UPDATE_CONFIG_JSON || '{}').mode != 'windows-policy' && vars.LAZYMIND_DESKTOP_UPDATE_PUBLICATION_ENABLED == 'true'
     needs: [build-windows-installer, test-windows-installer]
     permissions:
       contents: read
@@ -329,10 +331,22 @@ jobs:
         if: inputs.enable_updates || inputs.enable_test_signed_updates
         shell: pwsh
         env:
-          WIN_CSC_LINK: ${{ secrets[inputs.enable_test_signed_updates && 'WINDOWS_TEST_CSC_LINK' || 'WIN_CSC_LINK'] }}
+          HAS_AUTHENTICODE_CERTIFICATE: ${{ secrets[inputs.enable_test_signed_updates && 'WINDOWS_TEST_CSC_LINK' || 'WIN_CSC_LINK'] != '' }}
+          PROTECTED_TAG: ${{ github.event_name == 'push' && github.ref_type == 'tag' && github.ref_protected }}
+          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
         run: |
-          foreach ($name in @('LAZYMIND_UPDATE_BUILD_CONFIG_JSON', 'LAZYMIND_UPDATE_BASE_URL', 'LAZYMIND_UPDATE_MINIMUM_SYSTEM_VERSION', 'WIN_CSC_LINK')) {
+          foreach ($name in @('LAZYMIND_UPDATE_BUILD_CONFIG_JSON', 'LAZYMIND_UPDATE_MINIMUM_SYSTEM_VERSION')) {
             if (-not [Environment]::GetEnvironmentVariable($name)) { throw "Missing update build input: $name" }
+          }
+          $configuration = $env:LAZYMIND_UPDATE_BUILD_CONFIG_JSON | ConvertFrom-Json
+          if ($configuration.mode -eq 'windows-policy') {
+            if ($env:PROTECTED_TAG -ne 'true' -or $env:RELEASE_TAG -notmatch '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
+              throw 'Windows policy installers require a protected stable release tag'
+            }
+            $base = [Uri]::new([Uri]$configuration.policyURL, '.').AbsoluteUri
+            "LAZYMIND_UPDATE_BASE_URL=$base" >> $env:GITHUB_ENV
+          } elseif (-not $env:LAZYMIND_UPDATE_BASE_URL -or $env:HAS_AUTHENTICODE_CERTIFICATE -ne 'true') {
+            throw 'Missing release base URL or Authenticode certificate for this update mode'
           }
 
       - name: Trust the configured public Windows test certificate
@@ -344,6 +358,7 @@ jobs:
         run: ./desktop/scripts/windows-test-certificate.ps1
 
       - name: Build Windows installer
+        if: '!inputs.enable_updates || fromJSON(vars.LAZYMIND_WINDOWS_UPDATE_CONFIG_JSON || ''{}'').mode != ''windows-policy'''
         env:
           LAZYMIND_DESKTOP_UPDATE_CONFIG_JSON: ${{ env.LAZYMIND_UPDATE_BUILD_CONFIG_JSON }}
           WIN_CSC_LINK: ${{ secrets[inputs.enable_test_signed_updates && 'WINDOWS_TEST_CSC_LINK' || 'WIN_CSC_LINK'] }}
@@ -356,6 +371,39 @@ jobs:
             -ExecutionPolicy Bypass `
             -File desktop/scripts/build-windows-x64.ps1 `
             installer
+
+      - name: Stage the final Windows policy application
+        id: windows_policy_stage
+        if: inputs.enable_updates && !inputs.enable_test_signed_updates && github.event_name == 'push' && github.ref_type == 'tag' && github.ref_protected && fromJSON(vars.LAZYMIND_WINDOWS_UPDATE_CONFIG_JSON || '{}').mode == 'windows-policy'
+        shell: pwsh
+        env:
+          LAZYMIND_DESKTOP_UPDATE_CONFIG_JSON: ${{ env.LAZYMIND_UPDATE_BUILD_CONFIG_JSON }}
+          LAZYMIND_RELEASE_BUILD: ${{ steps.release.outputs.is_tag }}
+        run: |
+          pwsh -NoProfile -NonInteractive -File desktop/scripts/build-windows-x64.ps1 stage-policy-installer
+          if ($LASTEXITCODE -ne 0) { throw 'Windows policy application staging failed' }
+          $appRoot = (Resolve-Path -LiteralPath 'desktop/dist/win-unpacked').Path
+          "app_root=$appRoot" >> $env:GITHUB_OUTPUT
+
+      - name: Sign the final Windows installed manifest
+        if: inputs.enable_updates && !inputs.enable_test_signed_updates && github.event_name == 'push' && github.ref_type == 'tag' && github.ref_protected && fromJSON(vars.LAZYMIND_WINDOWS_UPDATE_CONFIG_JSON || '{}').mode == 'windows-policy'
+        shell: pwsh
+        env:
+          WINDOWS_POLICY_UPDATE_PRIVATE_KEY: ${{ secrets.WINDOWS_POLICY_UPDATE_PRIVATE_KEY }}
+          WINDOWS_POLICY_UPDATE_KEY_ID: ${{ vars.LAZYMIND_WINDOWS_POLICY_UPDATE_KEY_ID }}
+          APP_ROOT: ${{ steps.windows_policy_stage.outputs.app_root }}
+        run: |
+          node desktop/scripts/windows-policy-release.mjs --app-root "$env:APP_ROOT" --key-id "$env:WINDOWS_POLICY_UPDATE_KEY_ID"
+          if ($LASTEXITCODE -ne 0) { throw 'Windows installed manifest signing failed' }
+
+      - name: Package the sealed Windows policy NSIS installer
+        if: inputs.enable_updates && !inputs.enable_test_signed_updates && github.event_name == 'push' && github.ref_type == 'tag' && github.ref_protected && fromJSON(vars.LAZYMIND_WINDOWS_UPDATE_CONFIG_JSON || '{}').mode == 'windows-policy'
+        shell: pwsh
+        env:
+          APP_ROOT: ${{ steps.windows_policy_stage.outputs.app_root }}
+        run: |
+          pwsh -NoProfile -NonInteractive -File desktop/scripts/build-windows-x64.ps1 pack-policy-installer -Prepackaged "$env:APP_ROOT"
+          if ($LASTEXITCODE -ne 0) { throw 'Windows policy NSIS packaging failed' }
 
       - name: Validate and stage installer
         id: package
@@ -396,11 +444,16 @@ jobs:
           $hash = Get-FileHash -LiteralPath $outputPath -Algorithm SHA256
           $signature = Get-AuthenticodeSignature -LiteralPath $outputPath
           if ('${{ inputs.enable_updates || inputs.enable_test_signed_updates }}' -eq 'true') {
-            if ($signature.Status -ne 'Valid') { throw 'Update installer must have a valid Authenticode signature' }
             $helperConfig = & 'desktop/dist/win-unpacked/resources/runtime/bin/lazymind-update-helper.exe' config | ConvertFrom-Json
             if ($LASTEXITCODE -ne 0 -or $helperConfig.status -ne 'enabled') { throw 'Invalid built update helper' }
-            $publisher = $signature.SignerCertificate.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
-            if ($publisher -cne $helperConfig.config.signingIdentity) { throw 'Installer publisher does not match update identity' }
+            if ($helperConfig.config.mode -eq 'windows-policy') {
+              & 'desktop/dist/win-unpacked/resources/runtime/bin/lazymind-update-helper.exe' verify-identity
+              if ($LASTEXITCODE -ne 0) { throw 'Windows installed manifest verification failed' }
+            } else {
+              if ($signature.Status -ne 'Valid') { throw 'Update installer must have a valid Authenticode signature' }
+              $publisher = $signature.SignerCertificate.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
+              if ($publisher -cne $helperConfig.config.signingIdentity) { throw 'Installer publisher does not match update identity' }
+            }
           }
           "installer_path=$outputPath" | Add-Content -LiteralPath $env:GITHUB_OUTPUT
           "artifact_name=$outputName" | Add-Content -LiteralPath $env:GITHUB_OUTPUT
@@ -714,7 +767,8 @@ jobs:
         shell: pwsh
         env:
           EXPECTED_VERSION: ${{ needs.build-windows-installer.outputs.package_version }}
-          EXPECT_SIGNED_RUNTIME: ${{ inputs.enable_updates || inputs.enable_test_signed_updates }}
+          EXPECT_SIGNED_RUNTIME: ${{ inputs.enable_test_signed_updates || (inputs.enable_updates && fromJSON(vars.LAZYMIND_WINDOWS_UPDATE_CONFIG_JSON || '{}').mode != 'windows-policy') }}
+          EXPECT_WINDOWS_POLICY: ${{ inputs.enable_updates && !inputs.enable_test_signed_updates && fromJSON(vars.LAZYMIND_WINDOWS_UPDATE_CONFIG_JSON || '{}').mode == 'windows-policy' }}
         run: |
           $ErrorActionPreference = "Stop"
           $installDir = Join-Path $env:LOCALAPPDATA "Programs\LazyMind"
@@ -728,6 +782,10 @@ jobs:
 
           $runtime = Join-Path $installDir "resources\runtime"
           $bin = Join-Path $runtime "bin"
+          if ($env:EXPECT_WINDOWS_POLICY -eq 'true') {
+            & (Join-Path $bin 'lazymind-update-helper.exe') verify-identity
+            if ($LASTEXITCODE -ne 0) { throw 'Installed Windows policy application did not pass its signed manifest' }
+          }
           $manifest = Get-Content -Raw -LiteralPath (Join-Path $runtime "manifest.json") | ConvertFrom-Json -AsHashtable
           foreach ($requiredPin in @("lark-cli.sha256", "feishu-credential-helper.sha256", "github-auth-helper.sha256")) {
             if (-not (Test-Path -LiteralPath (Join-Path $bin $requiredPin) -PathType Leaf)) {

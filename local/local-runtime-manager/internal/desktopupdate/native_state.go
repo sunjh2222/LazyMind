@@ -57,6 +57,9 @@ type NativeRepairTarget struct {
 	AcceptanceDigest string               `json:"acceptanceDigest,omitempty"`
 
 	TargetComponents map[string]ComponentDescriptor `json:"targetComponents,omitempty"`
+
+	InstalledManifestSHA256 string `json:"installedManifestSHA256,omitempty"`
+	InstalledManifestSize   int64  `json:"installedManifestSize,omitempty"`
 }
 type NativeRecord struct {
 	Version              int                   `json:"version"`
@@ -102,6 +105,12 @@ type NativeRecord struct {
 	Reason               string                `json:"reason,omitempty"`
 	Activation           json.RawMessage       `json:"activation,omitempty"`
 	Owner                string                `json:"owner,omitempty"`
+
+	Mode                    string `json:"mode,omitempty"`
+	InstalledManifestPath   string `json:"installedManifestPath,omitempty"`
+	InstalledManifestSHA256 string `json:"installedManifestSHA256,omitempty"`
+	InstalledManifestSize   int64  `json:"installedManifestSize,omitempty"`
+	WindowsInstallVerified  bool   `json:"windowsInstallVerified,omitempty"`
 
 	ComponentUpdates map[string]NativeComponentUpdate `json:"componentUpdates,omitempty"`
 	WantedComponents []string                         `json:"wantedComponents,omitempty"`
@@ -189,6 +198,29 @@ func validateNativeRecord(r *NativeRecord) error {
 		}
 	}
 	if !filepath.IsAbs(r.RuntimeRoot) || !filepath.IsAbs(r.InstallationRoot) || !digestPattern.MatchString(r.PackageSHA256) || !digestPattern.MatchString(r.ComponentsSHA256) || !digestPattern.MatchString(r.PolicyDigest) || r.PackageSize <= 0 || r.ComponentsSize <= 0 || !filepath.IsAbs(r.PackagePath) || !filepath.IsAbs(r.ComponentsPath) {
+		return bad()
+	}
+	switch r.Mode {
+	case "":
+		if r.InstalledManifestPath != "" || r.InstalledManifestSHA256 != "" || r.InstalledManifestSize != 0 || r.WindowsInstallVerified {
+			return bad()
+		}
+	case "windows-policy":
+		if r.Platform != "windows" || r.Arch != "amd64" || r.Audience != "official" || r.Channel != "stable" ||
+			!filepath.IsAbs(r.InstalledManifestPath) || !digestPattern.MatchString(r.InstalledManifestSHA256) ||
+			r.InstalledManifestSize <= 0 || r.InstalledManifestSize > MaxEnvelopeBytes {
+			return bad()
+		}
+		if r.Phase == "activated" && !r.WindowsInstallVerified ||
+			r.WindowsInstallVerified && (r.Phase != "installing" && r.Phase != "activated") {
+			return bad()
+		}
+		if repair := r.RepairTarget; r.WindowsInstallVerified && repair != nil &&
+			(!digestPattern.MatchString(repair.InstalledManifestSHA256) || !digestPattern.MatchString(repair.AcceptanceDigest) ||
+				repair.InstalledManifestSize <= 0 || repair.InstalledManifestSize > MaxEnvelopeBytes) {
+			return bad()
+		}
+	default:
 		return bad()
 	}
 	scope, err := normalizeScope(r.Scope)
@@ -500,8 +532,12 @@ func runNativeUpdateState(ctx context.Context, root, action string, input []byte
 		if r != nil {
 			return blocked("update_transaction_conflict")
 		}
-		var candidate NativeRecord
-		if decodeStrict(input, &candidate) != nil || candidate.Phase != "pending" || validateNativeRecord(&candidate) != nil {
+		var candidate struct {
+			NativeRecord
+			WindowsInstallVerified json.RawMessage `json:"windowsInstallVerified"`
+		}
+		if decodeStrict(input, &candidate) != nil || candidate.WindowsInstallVerified != nil ||
+			candidate.Phase != "pending" || validateNativeRecord(&candidate.NativeRecord) != nil {
 			return blocked("update_request_invalid")
 		}
 		if UnsignedTestBuild {
@@ -528,7 +564,7 @@ func runNativeUpdateState(ctx context.Context, root, action string, input []byte
 		if removeBootObservation(root, candidate.TransactionID) != nil {
 			return blocked("update_record_write")
 		}
-		if writeNativeRecord(root, &candidate) != nil {
+		if writeNativeRecord(root, &candidate.NativeRecord) != nil {
 			return blocked("update_record_write")
 		}
 		return result("pending", "")
@@ -599,6 +635,9 @@ func runNativeUpdateState(ctx context.Context, root, action string, input []byte
 		}
 		status = "installing"
 	case "activated":
+		if r.Mode == "windows-policy" && !r.WindowsInstallVerified {
+			return blocked("update_incomplete")
+		}
 		if r.Phase == "pending" || req.ReleaseID != effective || req.DataProfile != profile || req.ComponentMode != r.ComponentMode || (len(r.WantedComponents) == 0 && !matchesComponents()) {
 			return blocked("update_transaction_conflict")
 		}
@@ -612,9 +651,13 @@ func runNativeUpdateState(ctx context.Context, root, action string, input []byte
 		status = "activated"
 	case "repair":
 		r.Phase = "repair"
+		r.WindowsInstallVerified = false
 		r.Reason = req.Reason
 		status = "repair"
 	case "adopt-repair":
+		if r.Mode == "windows-policy" {
+			return blocked("repair_target_not_accepted")
+		}
 		if (r.Phase != "repair" && r.Phase != "installing") || req.SourceID != r.SourceReleaseID || req.FailedID != r.TargetReleaseID || !digestPattern.MatchString(req.AcceptanceDigest) || req.RepairTarget == nil || req.RepairTarget.DataProfile != r.SourceDataProfile {
 			return blocked("repair_target_not_accepted")
 		}
@@ -648,6 +691,7 @@ func runNativeUpdateState(ctx context.Context, root, action string, input []byte
 			}
 		}
 		r.Phase = "repair"
+		r.WindowsInstallVerified = false
 		r.RepairTarget = req.RepairTarget
 		r.RepairTarget.AcceptanceDigest = req.AcceptanceDigest
 		r.ComponentStage = nil

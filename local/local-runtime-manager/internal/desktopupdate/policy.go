@@ -76,6 +76,11 @@ func ValidateConfig(c Config) error {
 		if c.Audience != "official" || !(c.Channel == "stable" || c.Channel == "beta" || c.Channel == "canary") {
 			return failure("configuration_invalid", nil)
 		}
+	} else if c.Mode == "windows-policy" {
+		if c.Platform != "windows" || c.Audience != "official" || c.Channel != "stable" ||
+			c.UpdaterProtocol != 2 || !channelAllows(c.Channel, c.Version) {
+			return failure("configuration_invalid", nil)
+		}
 	} else {
 		return failure("configuration_invalid", nil)
 	}
@@ -128,30 +133,55 @@ func ResolveURL(c Config, raw string) (string, error) {
 	return "", failure("source_not_allowed", nil)
 }
 
-func decodeSigned(raw []byte, c Config) (Policy, []byte, error) {
-	var policy Policy
+func decodeSignedPayload(raw []byte, c Config) ([]byte, error) {
 	var envelope struct {
 		KeyID     string `json:"keyId"`
 		Payload   string `json:"payload"`
 		Signature string `json:"signature"`
 	}
 	if len(raw) > MaxEnvelopeBytes || decodeStrict(raw, &envelope) != nil {
-		return policy, nil, failure("policy_invalid", nil)
+		return nil, failure("policy_invalid", nil)
 	}
 	key, err := base64.StdEncoding.DecodeString(c.PublicKeys[envelope.KeyID])
 	if err != nil || len(key) != ed25519.PublicKeySize {
-		return policy, nil, failure("policy_signature", nil)
+		return nil, failure("policy_signature", nil)
 	}
 	payload, err := base64.StdEncoding.DecodeString(envelope.Payload)
 	if err != nil {
-		return policy, nil, failure("policy_invalid", err)
+		return nil, failure("policy_invalid", err)
 	}
 	signature, err := base64.StdEncoding.DecodeString(envelope.Signature)
 	if err != nil || !ed25519.Verify(key, payload, signature) {
-		return policy, nil, failure("policy_signature", nil)
+		return nil, failure("policy_signature", nil)
+	}
+	return payload, nil
+}
+
+type forbiddenManifestField struct{}
+
+func (*forbiddenManifestField) UnmarshalJSON([]byte) error {
+	return errors.New("installedManifest requires a Windows policy release")
+}
+
+func decodeSigned(raw []byte, c Config) (Policy, []byte, error) {
+	var policy Policy
+	payload, err := decodeSignedPayload(raw, c)
+	if err != nil {
+		return policy, nil, err
 	}
 	if err := decodeStrict(payload, &policy); err != nil {
 		return policy, nil, failure("policy_invalid", err)
+	}
+	if c.Mode != "windows-policy" {
+		// A typed nil cannot distinguish an absent key from an explicit JSON null.
+		var fields struct {
+			Releases []struct {
+				InstalledManifest forbiddenManifestField `json:"installedManifest"`
+			} `json:"releases"`
+		}
+		if err := json.Unmarshal(payload, &fields); err != nil {
+			return policy, nil, failure("policy_invalid", err)
+		}
 	}
 	if policy.SchemaVersion != c.UpdaterProtocol {
 		return policy, nil, failure("policy_schema", nil)
@@ -203,7 +233,18 @@ func validatePolicy(p *Policy, c Config, now time.Time) error {
 		if r.Platform == "" || r.Arch == "" {
 			return failure("policy_invalid", nil)
 		}
-		for _, artifact := range []*Artifact{&r.Package, &r.Feed, &r.Components} {
+		artifacts := []*Artifact{&r.Package, &r.Feed, &r.Components}
+		if c.Mode == "windows-policy" {
+			if r.Platform != "windows" || r.Arch != "amd64" || !channelAllows(c.Channel, r.Version) ||
+				r.UpdaterProtocol != c.UpdaterProtocol || r.MinUpdaterProtocol > c.UpdaterProtocol ||
+				r.InstalledManifest == nil || r.InstalledManifest.Size > MaxEnvelopeBytes {
+				return failure("policy_invalid", nil)
+			}
+			artifacts = append(artifacts, r.InstalledManifest)
+		} else if r.InstalledManifest != nil {
+			return failure("policy_invalid", nil)
+		}
+		for _, artifact := range artifacts {
 			if !digestPattern.MatchString(artifact.SHA256) || artifact.Size <= 0 {
 				return failure("policy_invalid", nil)
 			}

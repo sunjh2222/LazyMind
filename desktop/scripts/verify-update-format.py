@@ -172,6 +172,13 @@ def release_catalog(catalog_file, release):
     return catalog['components'], {key: value for key, value in rag.items() if key not in ('schemaVersion', 'signingMode')}
 
 
+def verified_installed_manifest(resources, release):
+    artifact = release.get('installedManifest')
+    require(isinstance(artifact, dict) and type(artifact.get('size')) is int and 0 < artifact['size'] <= MAX_METADATA,
+            'Windows policy requires an installed-manifest.json artifact')
+    return verified_file(resources, 'installed-manifest.json', artifact)
+
+
 def release_inputs(directory, unsigned_test):
     record = load_json(read_plain_file(directory, 'release.json'))
     config, release = record['config'], record['release']
@@ -187,6 +194,10 @@ def release_inputs(directory, unsigned_test):
         require(native_os == 'darwin' and config['mode'] == 'unsigned-test'
                 and config['channel'] == 'personal-test' and config['audience'] != 'official'
                 and config['signingIdentity'] == 'adhoc', 'Expected in-place unsigned-test build identity')
+    elif config['mode'] == 'windows-policy':
+        require(native_os == 'windows' and native_arch == 'amd64' and config['audience'] == 'official' and config['channel'] == 'stable',
+                'Expected the official stable Windows x64 update mode')
+        verified_installed_manifest(directory, release)
     else:
         require(config['mode'] == 'official' and config['audience'] == 'official',
                 'Expected an officially signed build')
@@ -351,7 +362,7 @@ def remove_empty_install_tree(directory):
 
 
 @contextmanager
-def materialized_app(package, release, directory, unsigned_test):
+def materialized_app(package, release, directory, unsigned_test, *, mode='official'):
     if release['platform'] == 'darwin':
         name = 'LazyMind.app'
         probe('mac.validate-zip', validate_app_zip, package, name, release['package']['unpackedBytes'])
@@ -366,12 +377,19 @@ def materialized_app(package, release, directory, unsigned_test):
     require(os.environ.get('RUNNER_ENVIRONMENT') == 'github-hosted' and os.environ.get('GITHUB_ACTIONS') == 'true',
             'Windows evidence requires a disposable GitHub-hosted runner')
     role = 'source' if directory.name == 'source-app' else 'target'
-    probe(role + '.verify-installer-signature', verify_windows_signature, package, release['signingIdentity'])
+    if mode == 'windows-policy':
+        # The build artifact or signed history pins the installer bytes.
+        verified_file(package.parent, package.name, release['package'])
+    else:
+        probe(role + '.verify-installer-signature', verify_windows_signature, package, release['signingIdentity'])
     install_dir = probe(role + '.install', install_windows_default, package)
     uninstall = read_plain_file(install_dir, 'Uninstall LazyMind.exe')
     try:
         app = read_plain_file(install_dir, 'LazyMind.exe')
-        probe(role + '.verify-app-signature', verify_windows_signature, app, release['signingIdentity'])
+        if mode == 'windows-policy':
+            verified_installed_manifest(install_dir / 'resources', release)
+        else:
+            probe(role + '.verify-app-signature', verify_windows_signature, app, release['signingIdentity'])
         yield install_dir / 'resources'
     finally:
         probe(role + '.uninstall', run_windows_installer, uninstall, '/S', timeout=300)
@@ -390,7 +408,7 @@ def format_profile(runtime):
     return 'format-v2-' + hashlib.sha256(encoded).hexdigest()
 
 
-def inspect_runtime(resources, release, catalog_file, descriptor, expected=None):
+def inspect_runtime(resources, release, catalog_file, descriptor, expected=None, *, mode=None):
     runtime = resources / 'runtime'
     manifest = read_plain_file(runtime, 'manifest.json')
     with manifest.open('rb') as stream:
@@ -403,14 +421,19 @@ def inspect_runtime(resources, release, catalog_file, descriptor, expected=None)
     require(packaged_catalog.read_bytes() == catalog_file.read_bytes(), 'Packaged component catalog differs from staging')
     identity = load_json(read_plain_file(resources, 'app-update.yml'))['lazymind']
     expected_identity = {key: release[key] for key in ('releaseId', 'version', 'platform', 'arch', 'signingIdentity')}
-    expected_identity.update(protocol=release['updaterProtocol'],
-                             mode=expected['config']['mode'] if expected else identity['mode'])
+    mode = expected['config']['mode'] if expected else mode or identity['mode']
+    expected_identity.update(protocol=release['updaterProtocol'], mode=mode)
     require(identity == expected_identity, 'Packaged update metadata differs from release record')
     windows = release['platform'] == 'windows'
     helper = read_plain_file(runtime, 'bin/lazymind-update-helper.exe' if windows else 'bin/lazymind-update-helper')
-    if windows:
+    if windows and mode == 'windows-policy':
+        verified_installed_manifest(resources, release)
+        action = 'verify-identity'
+    else:
+        action = 'config'
+    if windows and mode != 'windows-policy':
         probe('runtime.verify-helper-signature', verify_windows_signature, helper, release['signingIdentity'])
-    response = json.loads(probe('runtime.read-helper-config', output, [str(helper), 'config']))
+    response = json.loads(probe('runtime.read-helper-config', output, [str(helper), action]))
     require(set(response) == {'status', 'config'} and response['status'] == 'enabled',
             'Packaged helper update configuration is disabled or invalid')
     config = response['config']
@@ -480,7 +503,10 @@ def download_source(release, target, directory):
     opener = build_opener(publisher.PinnedRedirects(origins))
     package = directory / ('package.zip' if release['platform'] == 'darwin' else 'package.exe')
     catalog = directory / 'components.json'
-    for path, artifact in [(catalog, release['components']), (package, release['package'])]:
+    downloads = [(catalog, release['components']), (package, release['package'])]
+    if config['mode'] == 'windows-policy':
+        downloads.append((directory / 'installed-manifest.json', release['installedManifest']))
+    for path, artifact in downloads:
         url = artifact['url']
         parsed = urlsplit(url)
         origin = 'https://' + parsed.netloc
@@ -489,7 +515,7 @@ def download_source(release, target, directory):
         publisher.destination(url, origin + '/')
         limit = artifact['size']
         require(type(limit) is int and limit > 0 and SHA256.fullmatch(artifact['sha256']), 'Invalid artifact size or SHA-256')
-        require(path != catalog or limit <= MAX_METADATA, 'Component catalog exceeds the size limit')
+        require(path == package or limit <= MAX_METADATA, path.name + ' exceeds the size limit')
         digest = hashlib.sha256()
         size = 0
         with opener.open(url, timeout=60) as stream, path.open('xb') as file:
@@ -527,6 +553,7 @@ def generate_evidence(args):
         require(not args.source_record_output.exists() and args.source_record_output.resolve() != args.output.resolve(),
                 'Source record output must be a new, separate file')
     target, new_package, new_catalog, new_components = probe('target.validate-artifacts', release_inputs, args.target, args.unsigned_test)
+    mode = {'mode': 'windows-policy'} if target['config']['mode'] == 'windows-policy' else {}
     tools = load_script('verify-python-components.py')
     scratch = os.environ.get('RUNNER_TEMP') if sys.platform == 'win32' else None
     with tempfile.TemporaryDirectory(prefix='lm-update-evidence-', dir=scratch) as temp:
@@ -540,12 +567,12 @@ def generate_evidence(args):
                 release = load_json(args.published_source)
                 old_package, old_catalog = probe('source.download', download_source, release, target, staging)
                 old_components, descriptor = release_catalog(old_catalog, release)
-                resources = old_app.enter_context(materialized_app(old_package, release, staging / 'source-app', args.unsigned_test))
-                source, runtime, python = probe('source.inspect-runtime', inspect_runtime, resources, release, old_catalog, descriptor)
+                resources = old_app.enter_context(materialized_app(old_package, release, staging / 'source-app', args.unsigned_test, **mode))
+                source, runtime, python = probe('source.inspect-runtime', inspect_runtime, resources, release, old_catalog, descriptor, **mode)
             reason = check_pair(source, target, old_components, new_components)
             if not reason:
                 if args.source:
-                    resources = old_app.enter_context(materialized_app(old_package, source['release'], staging / 'source-app', args.unsigned_test))
+                    resources = old_app.enter_context(materialized_app(old_package, source['release'], staging / 'source-app', args.unsigned_test, **mode))
                     runtime, python = probe('source.inspect-runtime', verify_runtime, resources, source, old_catalog)
                 entry = old_components['rag']
                 overlay = probe('source.extract-rag', extract_overlay, entry, staging / 'source-rag', args.source_components_dir, python, source['config'], tools)
@@ -555,7 +582,7 @@ def generate_evidence(args):
         # Source and target installs must never overlap on Windows. Even for a
         # negative historical result, verify the new package's recorded format.
         if not args.source or not reason:
-            with materialized_app(new_package, target['release'], staging / 'target-app', args.unsigned_test) as resources:
+            with materialized_app(new_package, target['release'], staging / 'target-app', args.unsigned_test, **mode) as resources:
                 runtime, python = probe('target.inspect-runtime', verify_runtime, resources, target, new_catalog)
                 if not reason:
                     entry = new_components['rag']

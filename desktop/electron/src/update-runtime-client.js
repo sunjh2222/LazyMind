@@ -2,6 +2,16 @@ const path = require("node:path");
 const failure = code => Object.assign(new Error(code), { code });
 const v1HandoffTimeoutMs = 180_000;
 
+function validInstalledManifest(artifact) {
+  return typeof artifact?.url === "string" && artifact.url.length > 0
+    && /^[a-f0-9]{64}$/.test(artifact.sha256 || "")
+    && Number.isSafeInteger(artifact.size) && artifact.size > 0 && artifact.size <= 1024 * 1024;
+}
+
+function validInstalledManifestPath(filename) {
+  return typeof filename === "string" && path.isAbsolute(filename) && !filename.includes("\0");
+}
+
 function targetComponentRevisions(plan) {
   if (typeof plan?.sourceHadRAG !== "boolean" || plan.componentMode !== (plan.sourceHadRAG ? "sync-target" : "absent")) return null;
   const missing = plan.unavailableComponents === undefined ? [] : plan.unavailableComponents;
@@ -86,8 +96,15 @@ function createUpdateRuntimeClient({ runSidecar, localWork, setAdmission, stopAu
   return {
     nextEpoch() { return lastEpoch = Math.max(lastEpoch + 1, Date.now()); },
     async prepareComponents(release, receipt) {
-      const value = await bootstrap("prepare-components", ["--release-id", release.releaseId,
-        "--package", receipt.packagePath, "--components", receipt.componentsPath, "--control-stdin"], 40 * 60_000);
+      const args = ["--release-id", release.releaseId,
+        "--package", receipt.packagePath, "--components", receipt.componentsPath, "--control-stdin"];
+      if (release.installedManifest !== undefined) {
+        if (!validInstalledManifest(release.installedManifest) || !validInstalledManifestPath(receipt.installedManifestPath)) {
+          throw failure("installed_manifest_invalid");
+        }
+        args.push("--installed-manifest", receipt.installedManifestPath);
+      }
+      const value = await bootstrap("prepare-components", args, 40 * 60_000);
       if (!/^[a-f0-9]{32}$/.test(value?.transactionId || "")) throw failure("component_state_unknown");
       preparation = undefined;
       transactionId = value.transactionId;
@@ -141,4 +158,4 @@ function createUpdateRuntimeClient({ runSidecar, localWork, setAdmission, stopAu
     verifyStartup,
   };
 }
-module.exports = { createUpdateRuntimeClient, targetComponentRevisions };
+module.exports = { createUpdateRuntimeClient, targetComponentRevisions, validInstalledManifest, validInstalledManifestPath };

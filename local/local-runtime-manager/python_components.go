@@ -248,11 +248,20 @@ func resolvePythonComponentCatalog(paths RuntimePaths, data []byte, strictInstal
 			continue
 		}
 		if current {
+			wanted := slices.Contains(bound.Wanted, id)
 			revision := bound.VerifiedComponents[id]
-			var selected pythonComponent
 			file := filepath.Join(paths.RuntimeRoot, "deps", "python-components", id, "catalog-"+entry.Tag+".json")
 			receipt, e := os.ReadFile(file)
-			valid := slices.Contains(bound.Wanted, id) && componentDigestPattern.MatchString(revision) && e == nil && json.Unmarshal(receipt, &selected) == nil &&
+			// Old fixed-URL installs can lack a receipt. Only the exact
+			// packaged revision already verified for this release may be used.
+			if wanted && entry.CatalogURL == "" && os.IsNotExist(e) && revision == entry.Revision &&
+				entry.Platform == catalog.Platform && entry.Arch == catalog.Arch {
+				if _, err := os.Lstat(file); os.IsNotExist(err) && installedPythonComponentPath(paths, entry) != "" {
+					continue
+				}
+			}
+			var selected pythonComponent
+			valid := wanted && componentDigestPattern.MatchString(revision) && e == nil && json.Unmarshal(receipt, &selected) == nil &&
 				selected.ID == id && componentDigestPattern.MatchString(selected.SHA256) && selected.Revision == revision && selected.Tag == entry.Tag && selected.Platform == entry.Platform && selected.Arch == entry.Arch &&
 				selected.CatalogURL == entry.CatalogURL && selected.PythonABI == entry.PythonABI && selected.BaseFingerprint == entry.BaseFingerprint &&
 				reflect.DeepEqual(selected.Packages, entry.Packages) && installedPythonComponentPath(paths, selected) != ""
@@ -260,7 +269,7 @@ func resolvePythonComponentCatalog(paths RuntimePaths, data []byte, strictInstal
 				catalog.Components[id] = selected
 			} else {
 				entry.selectionInvalid = true
-				entry.awaitingProbe = slices.Contains(bound.Wanted, id) && revision == ""
+				entry.awaitingProbe = wanted && revision == ""
 				catalog.Components[id] = entry
 			}
 			continue

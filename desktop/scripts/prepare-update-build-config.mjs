@@ -7,6 +7,7 @@ import { isDeepStrictEqual } from "node:util";
 import testBuild from "./unsigned-update-build.cjs";
 
 const fields = new Set(["trustDomain", "audience", "channel", "mode", "releaseId", "version", "platform", "arch", "signingIdentity", "updaterProtocol", "policyURL", "allowedOrigins", "publicKeys"]);
+const stableVersion = /^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
 
 export function readUpdateBuildConfig(environment = process.env) {
   const filename = environment.LAZYMIND_DESKTOP_UPDATE_CONFIG;
@@ -36,6 +37,12 @@ export function prepareUpdateBuildConfig({ configuration, packageVersion, platfo
     if (!["stable", "beta", "canary"].includes(configuration.channel)
       || (configuration.channel === "stable" && prerelease)
       || (configuration.channel === "beta" && prerelease && !/^(beta|rc)(\.|$)/.test(prerelease))) throw new Error("Package version does not match its update channel");
+  } else if (configuration.mode === "windows-policy") {
+    if (platform !== "windows" || signingMode !== "none" || configuration.audience !== "official"
+      || configuration.channel !== "stable" || configuration.updaterProtocol !== 2
+      || typeof packageVersion !== "string" || !stableVersion.test(packageVersion)) {
+      throw new Error("Windows policy updates require an unsigned Windows x64 stable release and official protocol 2 configuration");
+    }
   } else throw new Error("Invalid update mode");
   if (![1, 2].includes(configuration.updaterProtocol)) throw new Error("Unsupported updater protocol");
   if (!configuration.publicKeys || Array.isArray(configuration.publicKeys) || typeof configuration.publicKeys !== "object" || !Object.keys(configuration.publicKeys).length) throw new Error("Update public keys are required");

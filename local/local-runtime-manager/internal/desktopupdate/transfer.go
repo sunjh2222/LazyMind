@@ -20,14 +20,15 @@ type Progress struct {
 }
 
 type DownloadReceipt struct {
-	Status         string `json:"status"`
-	ReleaseID      string `json:"releaseId"`
-	Version        string `json:"version"`
-	PolicySequence uint64 `json:"policySequence"`
-	PolicyDigest   string `json:"policyDigest"`
-	PackagePath    string `json:"packagePath"`
-	FeedPath       string `json:"feedPath"`
-	ComponentsPath string `json:"componentsPath"`
+	Status                string `json:"status"`
+	ReleaseID             string `json:"releaseId"`
+	Version               string `json:"version"`
+	PolicySequence        uint64 `json:"policySequence"`
+	PolicyDigest          string `json:"policyDigest"`
+	PackagePath           string `json:"packagePath"`
+	FeedPath              string `json:"feedPath"`
+	ComponentsPath        string `json:"componentsPath"`
+	InstalledManifestPath string `json:"installedManifestPath,omitempty"`
 }
 
 func Discover(ctx context.Context, c Config, state LocalState, root string, client *http.Client, now time.Time) (Decision, error) {
@@ -59,7 +60,17 @@ func Discover(ctx context.Context, c Config, state LocalState, root string, clie
 	// cannot be accepted using the older timestamp captured at command startup.
 	return Check(ctx, envelope, c, state, root, false, now.Add(time.Since(started)))
 }
+
+// DownloadCacheDirectory returns the cache partition for the configured update channel.
+func DownloadCacheDirectory(root string, c Config) string {
+	partition := sha256.Sum256([]byte(c.TrustDomain + "\x00" + c.Audience + "\x00" + c.Channel))
+	return filepath.Join(root, "downloads", hex.EncodeToString(partition[:]))
+}
+
 func Download(ctx context.Context, c Config, state LocalState, root, expectedReleaseID string, client *http.Client, now time.Time, progress func(Progress)) (DownloadReceipt, error) {
+	if err := ValidateWindowsPolicyDownloadCache(root, c); err != nil {
+		return DownloadReceipt{}, err
+	}
 	decision, err := Discover(ctx, c, state, root, client, now)
 	if err != nil {
 		return DownloadReceipt{}, err
@@ -68,10 +79,15 @@ func Download(ctx context.Context, c Config, state LocalState, root, expectedRel
 		return DownloadReceipt{}, failure("offer_changed", nil)
 	}
 	target := decision.Next
-	partition := sha256.Sum256([]byte(c.TrustDomain + "\x00" + c.Audience + "\x00" + c.Channel))
-	dir := filepath.Join(root, "downloads", hex.EncodeToString(partition[:]))
+	dir := DownloadCacheDirectory(root, c)
+	if err := ValidateWindowsPolicyDownloadCache(root, c); err != nil {
+		return DownloadReceipt{}, err
+	}
 	if err := ensureDirectory(dir); err != nil {
 		return DownloadReceipt{}, failure("cache_write", err)
+	}
+	if err := ValidateWindowsPolicyDownloadCache(root, c); err != nil {
+		return DownloadReceipt{}, err
 	}
 	release, err := acquireDownloadLock(ctx, dir)
 	if err != nil {
@@ -107,6 +123,9 @@ func Download(ctx context.Context, c Config, state LocalState, root, expectedRel
 		artifacts = append(artifacts, downloadArtifact{target.Feed, ".yml", &receipt.FeedPath})
 	}
 	artifacts = append(artifacts, downloadArtifact{target.Components, ".json", &receipt.ComponentsPath})
+	if c.Mode == "windows-policy" {
+		artifacts = append(artifacts, downloadArtifact{*target.InstalledManifest, ".json", &receipt.InstalledManifestPath})
+	}
 	var total, completed, reported int64
 	var lastSent time.Time
 	var lastDelivered int64

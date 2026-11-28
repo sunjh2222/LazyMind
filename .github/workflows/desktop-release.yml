@@ -59,7 +59,10 @@ jobs:
     with:
       use_current_run: true
       platform: windows
-      source_build_run_id: ${{ vars.LAZYMIND_UPDATE_SOURCE_BUILD_RUN_ID }}
+      # The independent Windows channel uses its own signed public policy history.
+      source_build_run_id: ${{ fromJSON(vars.LAZYMIND_WINDOWS_UPDATE_CONFIG_JSON || '{}').mode != 'windows-policy' && vars.LAZYMIND_UPDATE_SOURCE_BUILD_RUN_ID || '' }}
+    secrets:
+      WINDOWS_POLICY_UPDATE_PRIVATE_KEY: ${{ github.ref_protected && secrets.WINDOWS_POLICY_UPDATE_PRIVATE_KEY || '' }}
 
   release:
     name: Create draft desktop release

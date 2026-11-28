@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 
+import { realpathSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
 import { spawn } from "node:child_process";
+import { pathToFileURL } from "node:url";
 import { commandRunner, isPortClosed, localGatewayURL } from "./runtime-smoke.mjs";
 
 const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -258,8 +260,25 @@ function parseOptions(argv) {
   };
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
-  runPackagedAppSmoke(parseOptions(process.argv.slice(2)))
-    .then(({ gateway }) => console.log(`packaged Desktop smoke passed at ${gateway}`))
-    .catch((error) => { console.error(error); process.exitCode = 1; });
+function invokedDirectly(entry) {
+  if (!entry) return false;
+  if (import.meta.url === pathToFileURL(entry).href) return true;
+  try {
+    // The ESM loader may resolve an alias that is still present in argv.
+    return import.meta.url === pathToFileURL(realpathSync(entry)).href;
+  } catch {
+    return false;
+  }
+}
+
+if (invokedDirectly(process.argv[1])) {
+  const options = parseOptions(process.argv.slice(2));
+  if (!options.app || !options.runtimeRoot) {
+    console.error("Usage: node packaged-app-smoke.mjs --app <path> --runtime-root <path>");
+    process.exitCode = 1;
+  } else {
+    runPackagedAppSmoke(options)
+      .then(({ gateway }) => console.log(`packaged Desktop smoke passed at ${gateway}`))
+      .catch((error) => { console.error(error); process.exitCode = 1; });
+  }
 }

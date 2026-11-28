@@ -52,10 +52,17 @@ func prepareBundledPythonRuntime(ctx context.Context, paths RuntimePaths, report
 		return fmt.Errorf("inspect bundled Python payload: %w", err)
 	}
 
+	keepArchive, err := keepSignedPythonPayload(ctx, paths)
+	if err != nil {
+		return fmt.Errorf("verify identity before preparing bundled Python payload: %w", err)
+	}
+
 	markerPath := filepath.Join(paths.ResourcesRoot, pythonPayloadMarkerName)
 	marker, markerErr := os.ReadFile(markerPath)
 	if markerErr == nil && strings.TrimSpace(string(marker)) == archiveIdentity && pythonPayloadRootsExist(paths.ResourcesRoot) {
-		_ = os.Remove(archivePath)
+		if !keepArchive {
+			_ = os.Remove(archivePath)
+		}
 		return nil
 	}
 	if markerErr != nil && !os.IsNotExist(markerErr) {
@@ -118,12 +125,40 @@ func prepareBundledPythonRuntime(ctx context.Context, paths RuntimePaths, report
 	}); err != nil {
 		return fmt.Errorf("write bundled Python payload marker: %w", err)
 	}
-	// The expanded trees replace the archive. Removing it keeps the installed
-	// footprint equivalent to the old full installer instead of storing Python
-	// twice. A transient antivirus lock is harmless; the marker avoids another
-	// extraction and the next launch retries this removal.
-	_ = os.Remove(archivePath)
+	if !keepArchive {
+		// An antivirus lock can delay cleanup. The marker lets the next launch
+		// retry removal without extracting the payload again.
+		_ = os.Remove(archivePath)
+	}
 	return nil
+}
+
+func keepSignedPythonPayload(ctx context.Context, paths RuntimePaths) (bool, error) {
+	helper := filepath.Join(paths.ResourcesRoot, "bin", executableName("lazymind-update-helper"))
+	info, err := os.Lstat(helper)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !info.Mode().IsRegular() {
+		return false, updateStateFailure("native_install_unavailable")
+	}
+	config, configErr := readInstalledUpdateConfiguration(ctx, paths, "config")
+	if configErr == nil && config.Mode != "windows-policy" {
+		return false, nil
+	}
+	// A formal Windows build needs the full file check even when its manifest
+	// is missing. If the mode query failed, only a verified identity may decide.
+	identity, err := readNativeConfiguration(ctx, paths)
+	if err != nil {
+		return false, err
+	}
+	if configErr == nil && identity.Mode != config.Mode {
+		return false, updateStateFailure("build_identity_mismatch")
+	}
+	return identity.Mode == "windows-policy", nil
 }
 
 func pythonPayloadRetryOptions(progress pythonPayloadProgress, report pythonPayloadProgressFunc) winfile.RetryOptions {

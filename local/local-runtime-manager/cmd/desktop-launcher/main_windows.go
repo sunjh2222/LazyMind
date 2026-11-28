@@ -20,7 +20,7 @@ func main() {
 	if err != nil {
 		failLaunch("resolve the LazyMind launcher path", err)
 	}
-	if err = checkPendingDesktopUpdate(launcherPath); err != nil {
+	if err = checkWindowsDesktopStartup(launcherPath); err != nil {
 		failLaunch("check pending desktop update", err)
 	}
 	electronPath := electronExecutablePath(launcherPath, electronExecutableName)
@@ -43,6 +43,10 @@ func main() {
 func failLaunch(operation string, err error) {
 	message := fmt.Sprintf("LazyMind could not start (%s): %v", operation, err)
 	logLaunch("%s", message)
+	if installerWarmup() {
+		// NSIS waits for this child. Report failure without a modal dialog.
+		os.Exit(1)
+	}
 	text, textErr := windows.UTF16PtrFromString(message)
 	caption, captionErr := windows.UTF16PtrFromString("LazyMind startup failed")
 	if textErr == nil && captionErr == nil {

@@ -7,6 +7,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import testBuild from "./unsigned-update-build.cjs";
+import { readSignedWindowsInstalledManifest } from "./windows-policy-release.mjs";
 
 export async function fingerprint(filename) {
   const stat = fs.lstatSync(filename);
@@ -23,7 +24,8 @@ export async function prepareRelease({ resources, packagePath, baseURL, minimumS
   const helper = path.join(runtime, "bin", `lazymind-update-helper${process.platform === "win32" ? ".exe" : ""}`);
   const status = JSON.parse(execFileSync(helper, ["config"], { encoding: "utf8", timeout: 35000, maxBuffer: 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] }));
   const unsigned = testBuild.readUnsignedTestBuildConfig();
-  if (status.status !== "enabled" || status.config?.mode !== (unsigned ? "unsigned-test" : "official")) throw new Error("Update configuration must be enabled in the built helper");
+  const modes = unsigned ? ["unsigned-test"] : ["official", "windows-policy"];
+  if (status.status !== "enabled" || !modes.includes(status.config?.mode)) throw new Error("Update configuration must be enabled in the built helper");
   const config = status.config;
   if (unsigned) {
     testBuild.validateUnsignedTestConfig(config);
@@ -40,12 +42,22 @@ export async function prepareRelease({ resources, packagePath, baseURL, minimumS
   if (!/^\d+\.\d+\.\d+$/.test(minimumSystemVersion)) throw new Error("Specify minimum system version as major.minor.patch");
   const base = new URL(baseURL);
   if (base.protocol !== "https:" || base.username || base.password || base.search || base.hash || !config.allowedOrigins.some(origin => origin.replace(/\/$/, "") === base.origin)) throw new Error("Release base URL must use a pinned HTTPS origin");
+  if (config.mode === "windows-policy" && base.href !== new URL(".", config.policyURL).href) {
+    throw new Error("Windows policy artifacts must publish under the policy directory");
+  }
   const extension = config.platform === "darwin" ? ".zip" : ".exe";
   if (path.extname(packagePath) !== extension) throw new Error(`Update package must be ${extension}`);
   const manifest = path.join(runtime, "manifest.json"), components = path.join(runtime, "config", "python-components.json");
   const manifestHash = (await fingerprint(manifest)).sha256;
-  const catalog = JSON.parse(fs.readFileSync(components, "utf8"));
+  const catalogBytes = fs.readFileSync(components);
+  const catalog = JSON.parse(catalogBytes);
   if (catalog.schemaVersion !== 1 || !catalog.components || typeof catalog.components !== "object" || catalog.platform !== config.platform || catalog.arch !== config.arch) throw new Error("Invalid built component catalog");
+  const installed = config.mode === "windows-policy"
+    ? await readSignedWindowsInstalledManifest(path.resolve(resources, ".."), config) : undefined;
+  if (installed && installed.files.find(file => file.path === "resources/runtime/config/python-components.json")?.sha256
+    !== createHash("sha256").update(catalogBytes).digest("hex")) {
+    throw new Error("The built component catalog differs from the signed installed manifest");
+  }
   if (config.platform === "darwin") {
     const app = path.resolve(resources, "..", "..");
     const verified = inspectSignature("/usr/bin/codesign", ["--verify", "--deep", "--strict", app], { encoding: "utf8" });
@@ -70,6 +82,7 @@ export async function prepareRelease({ resources, packagePath, baseURL, minimumS
   fs.mkdirSync(directory);
   fs.copyFileSync(packagePath, path.join(directory, `package${extension}`), fs.constants.COPYFILE_EXCL);
   fs.copyFileSync(components, path.join(directory, "components.json"), fs.constants.COPYFILE_EXCL);
+  if (installed) fs.writeFileSync(path.join(directory, "installed-manifest.json"), installed.envelope, { flag: "wx" });
   const packageHash = await fingerprint(path.join(directory, `package${extension}`));
   const sourceHash = await fingerprint(packagePath);
   if (!isDeepStrictEqual(packageHash, sourceHash)) throw new Error("Package changed while staging");
@@ -79,7 +92,9 @@ export async function prepareRelease({ resources, packagePath, baseURL, minimumS
   const release = { releaseId: config.releaseId, version: config.version, platform: config.platform, arch: config.arch,
     minimumSystemVersion, minUpdaterProtocol: config.updaterProtocol, updaterProtocol: config.updaterProtocol, signingIdentity: config.signingIdentity };
   const prefix = new URL(`releases/${config.releaseId}/`, base.href.endsWith("/") ? base.href : base.href + "/");
-  for (const [kind, filename] of [["package", `package${extension}`], ["feed", "feed.json"], ["components", "components.json"]]) {
+  const artifacts = [["package", `package${extension}`], ["feed", "feed.json"], ["components", "components.json"]];
+  if (installed) artifacts.push(["installedManifest", "installed-manifest.json"]);
+  for (const [kind, filename] of artifacts) {
     const { size, sha256 } = kind === "package" ? packageHash : await fingerprint(path.join(directory, filename));
     release[kind] = { url: new URL(filename, prefix).href, size, sha256 };
   }

@@ -47,17 +47,18 @@ type Artifact struct {
 }
 
 type Release struct {
-	ID                   string   `json:"releaseId"`
-	Version              string   `json:"version"`
-	Platform             string   `json:"platform"`
-	Arch                 string   `json:"arch"`
-	MinimumSystemVersion string   `json:"minimumSystemVersion"`
-	MinUpdaterProtocol   int      `json:"minUpdaterProtocol"`
-	UpdaterProtocol      int      `json:"updaterProtocol"`
-	SigningIdentity      string   `json:"signingIdentity"`
-	Package              Artifact `json:"package"`
-	Feed                 Artifact `json:"feed"`
-	Components           Artifact `json:"components"`
+	ID                   string    `json:"releaseId"`
+	Version              string    `json:"version"`
+	Platform             string    `json:"platform"`
+	Arch                 string    `json:"arch"`
+	MinimumSystemVersion string    `json:"minimumSystemVersion"`
+	MinUpdaterProtocol   int       `json:"minUpdaterProtocol"`
+	UpdaterProtocol      int       `json:"updaterProtocol"`
+	SigningIdentity      string    `json:"signingIdentity"`
+	Package              Artifact  `json:"package"`
+	Feed                 Artifact  `json:"feed"`
+	Components           Artifact  `json:"components"`
+	InstalledManifest    *Artifact `json:"installedManifest,omitempty"`
 }
 
 type RecoveryContract struct {

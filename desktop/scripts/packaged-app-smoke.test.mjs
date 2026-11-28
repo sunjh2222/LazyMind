@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { copyFileSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import test from "node:test";
+import { pathToFileURL } from "node:url";
 import {
   packagedExecutable,
   packagedRuntimePaths,
@@ -9,6 +14,66 @@ import {
   verifyPackagedAPI,
   waitForPackagedRuntime,
 } from "./packaged-app-smoke.mjs";
+
+function copiedSmokeCLI(t) {
+  const cwd = realpathSync(mkdtempSync(path.join(tmpdir(), "LazyMind smoke CLI ")));
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  const scripts = path.join(cwd, "scripts");
+  mkdirSync(scripts);
+  for (const name of ["packaged-app-smoke.mjs", "runtime-smoke.mjs"]) {
+    copyFileSync(new URL(name, import.meta.url), path.join(scripts, name));
+  }
+  const preload = path.join(cwd, "no-application-launch.cjs");
+  writeFileSync(preload, `
+const { syncBuiltinESMExports } = require("node:module");
+require("node:child_process").spawn = () => { throw new Error("unexpected application launch"); };
+syncBuiltinESMExports();
+`);
+  return {
+    cwd,
+    script: path.join(scripts, "packaged-app-smoke.mjs"),
+    run: (...args) => spawnSync(process.execPath, ["--require", preload, ...args], { cwd, encoding: "utf8", timeout: 10_000 }),
+  };
+}
+
+function assertMissingSmokeArguments(result) {
+  assert.ifError(result.error);
+  assert.equal(result.signal, null);
+  assert.notEqual(result.status, 0, "the smoke CLI must run instead of silently succeeding");
+  assert.match(result.stderr, /\busage:/i);
+  assert.match(result.stderr, /--app\b/);
+  assert.match(result.stderr, /--runtime-root\b/);
+  assert.doesNotMatch(result.stderr, /unexpected application launch/);
+}
+
+test("direct CLI reports missing arguments from a path containing spaces", (t) => {
+  const { script, run } = copiedSmokeCLI(t);
+  assertMissingSmokeArguments(run(script));
+});
+
+test("direct CLI reports missing arguments through a directory alias", (t) => {
+  const { cwd, script, run } = copiedSmokeCLI(t);
+  const alias = path.join(cwd, "linked scripts");
+  try {
+    symlinkSync(path.dirname(script), alias, process.platform === "win32" ? "junction" : "dir");
+  } catch (error) {
+    if (["EACCES", "EPERM", "ENOSYS", "ENOTSUP", "EOPNOTSUPP"].includes(error.code)) {
+      return t.skip(`directory aliases unavailable: ${error.code}`);
+    }
+    throw error;
+  }
+  assertMissingSmokeArguments(run(path.join(alias, path.basename(script))));
+});
+
+test("importing the smoke module does not run its CLI for an absent argv path", (t) => {
+  const { cwd, script, run } = copiedSmokeCLI(t);
+  const result = run("--input-type=module", "--eval", `import ${JSON.stringify(pathToFileURL(script).href)}; console.log("imported");`,
+    path.join(cwd, "absent.mjs"));
+  assert.ifError(result.error);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout.trim(), "imported");
+  assert.equal(result.stderr, "");
+});
 
 test("resolves packaged runtime paths on macOS and Windows", () => {
   assert.equal(

@@ -35,6 +35,8 @@ on:
     secrets:
       WINDOWS_TEST_UPDATE_POLICY_PRIVATE_KEY:
         required: false
+      WINDOWS_POLICY_UPDATE_PRIVATE_KEY:
+        required: false
       LAZYMIND_UPDATE_POLICY_PRIVATE_KEY:
         required: false
       MODELSCOPE_UPDATE_TOKEN:
@@ -78,6 +80,13 @@ jobs:
         with:
           go-version: "1.26.5"
           cache-dependency-path: local/local-runtime-manager/go.sum
+      - name: Run Windows policy handoff and recovery on the native runner
+        if: matrix.platform == 'windows' && !inputs.test_signed_updates && fromJSON(vars.LAZYMIND_WINDOWS_UPDATE_CONFIG_JSON || '{}').mode == 'windows-policy'
+        working-directory: local/local-runtime-manager
+        shell: pwsh
+        run: |
+          go test ./internal/desktopupdate ./cmd/update-helper -run '^TestWindowsPolicy(PackagedHandoffWaitsForInstallerExit|PublicLauncherVerifiesRecoveryBeforeCreatingAppProcess|VerifyIdentityCLI)$' -count=1 -v
+          if ($LASTEXITCODE -ne 0) { throw 'Windows policy native process tests failed' }
       - uses: astral-sh/setup-uv@v6
       - uses: actions/download-artifact@v8
         with:
@@ -269,8 +278,19 @@ jobs:
           done
       - name: Assemble and sign explicit update policy
         env:
-          UPDATE_PRIVATE_KEY: ${{ (inputs.test_signed_updates && secrets.WINDOWS_TEST_UPDATE_POLICY_PRIVATE_KEY) || (!inputs.test_signed_updates && secrets.LAZYMIND_UPDATE_POLICY_PRIVATE_KEY) || '' }}
-          UPDATE_KEY_ID: ${{ vars[inputs.test_signed_updates && 'LAZYMIND_WINDOWS_TEST_UPDATE_POLICY_KEY_ID' || 'LAZYMIND_UPDATE_POLICY_KEY_ID'] }}
+          UPDATE_PRIVATE_KEY: ${{
+            (inputs.test_signed_updates && secrets.WINDOWS_TEST_UPDATE_POLICY_PRIVATE_KEY) ||
+            (!inputs.test_signed_updates && inputs.platform == 'windows' && !inputs.unsigned_update_test &&
+             fromJSON(vars.LAZYMIND_WINDOWS_UPDATE_CONFIG_JSON || '{}').mode == 'windows-policy' &&
+             inputs.use_current_run && github.event_name == 'push' && github.ref_type == 'tag' && github.ref_protected &&
+             secrets.WINDOWS_POLICY_UPDATE_PRIVATE_KEY) ||
+            (!inputs.test_signed_updates && (inputs.platform != 'windows' || inputs.unsigned_update_test ||
+             fromJSON(vars.LAZYMIND_WINDOWS_UPDATE_CONFIG_JSON || '{}').mode != 'windows-policy') &&
+             secrets.LAZYMIND_UPDATE_POLICY_PRIVATE_KEY) || '' }}
+          UPDATE_KEY_ID: ${{
+            vars[inputs.test_signed_updates && 'LAZYMIND_WINDOWS_TEST_UPDATE_POLICY_KEY_ID' ||
+             inputs.platform == 'windows' && !inputs.unsigned_update_test && fromJSON(vars.LAZYMIND_WINDOWS_UPDATE_CONFIG_JSON || '{}').mode == 'windows-policy' &&
+             'LAZYMIND_WINDOWS_POLICY_UPDATE_KEY_ID' || 'LAZYMIND_UPDATE_POLICY_KEY_ID'] }}
           USE_CURRENT_RUN: ${{ inputs.use_current_run }}
         run: |
           set -euo pipefail

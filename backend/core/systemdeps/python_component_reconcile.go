@@ -185,6 +185,20 @@ func (want selectedComponentUpdate) target(root string, pin PythonComponent) Pyt
 	return pin
 }
 
+func (want selectedComponentUpdate) ready(root string, pin, target PythonComponent) bool {
+	// An old receipt records a past verification. Without content evidence
+	// the worker must still probe the local overlay on this startup.
+	return want.Verified[target.ID] == target.Revision && exactComponentSelection(root, target) &&
+		(target.Revision != pin.Revision || selectedComponentContentMatches(pythonComponentDir(root, target), target))
+}
+
+func reusablePinnedComponent(root string, target PythonComponent) bool {
+	// An old fixed-URL installation can have a ready payload without a
+	// catalog receipt. A missing marker permits a probe of that layout.
+	return exactComponentSelection(root, target) &&
+		(selectedComponentContentMatches(pythonComponentDir(root, target), target) || selectedComponentContentMissing(root, target))
+}
+
 // This read-only preflight avoids a full app signature check on every boot of
 // a desktop that has already verified all installed optional components.
 func HasPendingSelectedComponentWork(root, resources string) (bool, error) {
@@ -202,7 +216,7 @@ func HasPendingSelectedComponentWork(root, resources string) (bool, error) {
 	for _, id := range want.Wanted {
 		if pin, ok := catalog.Components[id]; ok {
 			target := want.target(root, pin)
-			if want.Verified[id] != target.Revision || !exactComponentSelection(root, target) {
+			if !want.ready(root, pin, target) {
 				return true, nil
 			}
 		}
@@ -236,7 +250,7 @@ func (env *PythonComponentMaintenanceContext) ReconcileSelectedPythonComponents(
 					return
 				}
 				chosen := current.target(env.RuntimeRoot, target)
-				if current.Verified[target.ID] == chosen.Revision && exactComponentSelection(env.RuntimeRoot, chosen) {
+				if current.ready(env.RuntimeRoot, target, chosen) {
 					return
 				}
 				err = env.reconcileComponent(ctx, current, catalog.RuntimeBaseFingerprint, target, chosen)
@@ -261,9 +275,6 @@ func (env *PythonComponentMaintenanceContext) reconcileComponent(ctx context.Con
 	active := filepath.Join(env.UpdaterRoot, "native-v2", "active.json")
 	if _, err := os.Lstat(active); !os.IsNotExist(err) {
 		return errors.New("update_transaction_busy")
-	}
-	if want.Verified[target.ID] == target.Revision && exactComponentSelection(env.RuntimeRoot, target) {
-		return nil
 	}
 	root, err := os.OpenRoot(env.RuntimeRoot)
 	if err != nil {
@@ -300,26 +311,44 @@ func (env *PythonComponentMaintenanceContext) reconcileComponent(ctx context.Con
 	}
 	defer root.RemoveAll(work)
 	updates := map[string]componentMaintenanceUpdate{id: {Target: target}}
-	var stage componentMaintenanceStageItem
-	if target.Revision != pin.Revision {
-		if !exactComponentSelection(env.RuntimeRoot, target) {
+	pinned := target.Revision == pin.Revision
+	final := pythonComponentDir(env.RuntimeRoot, target)
+	probe := func(path string) error {
+		probes := map[string]componentProbeInput{id: {Path: filepath.Join(path, "site-packages"), Descriptor: target}}
+		return verifyTargetComponents(ctx, probes, fingerprint, *env)
+	}
+	reuse := !pinned || reusablePinnedComponent(env.RuntimeRoot, target)
+	if reuse {
+		if !pinned && !exactComponentSelection(env.RuntimeRoot, target) {
 			return errors.New("component_selection_changed")
 		}
-		rel, err := filepath.Rel(env.RuntimeRoot, pythonComponentDir(env.RuntimeRoot, target))
+		if err := probe(final); err != nil {
+			if !pinned || ctx.Err() != nil {
+				return err
+			}
+			reuse = false
+		}
+	}
+	var stage componentMaintenanceStageItem
+	path := final
+	if reuse {
+		rel, err := filepath.Rel(env.RuntimeRoot, final)
 		if err != nil {
 			return err
 		}
 		stage = componentMaintenanceStageItem{StagePath: rel, Revision: target.Revision, SHA256: target.SHA256}
 	} else {
-		stage, err = stageTargetComponentIn(ctx, *env, root, componentMaintenanceRecord{}, target, work)
-	}
-	if err != nil {
-		return err
-	}
-	path := filepath.Join(env.RuntimeRoot, stage.StagePath)
-	probes := map[string]componentProbeInput{id: {Path: filepath.Join(path, "site-packages"), Descriptor: target}}
-	if err := verifyTargetComponents(ctx, probes, fingerprint, *env); err != nil {
-		return err
+		stage, err = downloadTargetComponentIn(ctx, *env, root, target, work)
+		if err != nil {
+			return err
+		}
+		path = filepath.Join(env.RuntimeRoot, stage.StagePath)
+		if err := writeSelectedComponentContent(path, target); err != nil {
+			return err
+		}
+		if err := probe(path); err != nil {
+			return err
+		}
 	}
 	state, err := componentMaintenanceStateLock(ctx, env.UpdaterRoot)
 	if err != nil {
@@ -341,14 +370,74 @@ func (env *PythonComponentMaintenanceContext) reconcileComponent(ctx context.Con
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := activateTargetComponents(env.RuntimeRoot, root, map[string]componentMaintenanceStageItem{id: stage}, updates, []string{id}); err != nil {
-		return err
+	stages := map[string]componentMaintenanceStageItem{id: stage}
+	switch {
+	case pinned && reuse:
+		if !reusablePinnedComponent(env.RuntimeRoot, target) {
+			return errors.New("component_selection_changed")
+		}
+		if current.Verified[id] == target.Revision {
+			return nil
+		}
+	case pinned:
+		if !selectedComponentContentMatches(path, target) {
+			return errors.New("component_file_invalid")
+		}
+		if !exactComponentSelection(env.RuntimeRoot, target) || !selectedComponentContentMatches(final, target) {
+			if err := replaceSelectedComponent(env.RuntimeRoot, root, parent, target, stages, updates); err != nil {
+				return err
+			}
+		}
+	default:
+		if err := activateTargetComponents(env.RuntimeRoot, root, stages, updates, []string{id}); err != nil {
+			return err
+		}
 	}
 	if current.Verified == nil {
 		current.Verified = map[string]string{}
 	}
 	current.Verified[id] = target.Revision
 	return current.save(env.RuntimeRoot)
+}
+
+// Keep the previous directory intact until the fixed ZIP passes verification.
+// This scoped replacement runs under the state and component writer locks.
+func replaceSelectedComponent(runtimeRoot string, root *os.Root, parent string, target PythonComponent, stages map[string]componentMaintenanceStageItem, updates map[string]componentMaintenanceUpdate) error {
+	final := filepath.Join("deps", "python-components", target.ID, target.Revision)
+	for dir := final; dir != "."; dir = filepath.Dir(dir) {
+		info, err := root.Lstat(dir)
+		if !os.IsNotExist(err) && (err != nil || info.Mode().Type() != os.ModeDir) {
+			return errors.New("component_path_invalid")
+		}
+	}
+	var backup string
+	if _, err := root.Lstat(final); err == nil {
+		previous, err := os.MkdirTemp(filepath.Join(runtimeRoot, parent), "previous-")
+		if err != nil {
+			return err
+		}
+		backup = filepath.Join(parent, filepath.Base(previous))
+		if err := root.Rename(final, filepath.Join(backup, "payload")); err != nil {
+			_ = root.Remove(backup)
+			return err
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	err := activateTargetComponents(runtimeRoot, root, stages, updates, []string{target.ID})
+	if backup == "" {
+		return err
+	}
+	if err != nil {
+		if rollback := root.RemoveAll(final); rollback != nil {
+			return errors.Join(err, rollback)
+		}
+		if rollback := root.Rename(filepath.Join(backup, "payload"), final); rollback != nil {
+			return errors.Join(err, rollback)
+		}
+	}
+	_ = root.RemoveAll(backup)
+	return err
 }
 
 // The explicit install path already owns the component writer lock. A later

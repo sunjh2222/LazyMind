@@ -22,33 +22,15 @@ func acceptPolicy(ctx context.Context, root string, c Config, sequence uint64, d
 	if !filepath.IsAbs(root) {
 		return failure("trust_location", nil)
 	}
-	partition := sha256.Sum256([]byte(c.TrustDomain + "\x00" + c.Audience + "\x00" + c.Channel))
-	dir := filepath.Join(root, "trust", "v1", hex.EncodeToString(partition[:]))
+	dir := policyLedgerDirectory(root, c)
 	if err := ensureDirectory(dir); err != nil {
 		return failure("trust_write", err)
 	}
-	lock, err := os.OpenFile(filepath.Join(dir, "ledger.lock"), os.O_CREATE|os.O_RDWR, 0600)
+	lock, err := lockPolicyLedger(ctx, dir)
 	if err != nil {
-		return failure("trust_lock", err)
+		return err
 	}
-	defer lock.Close()
-	lockCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	for {
-		locked, err := tryLock(lock)
-		if err != nil {
-			return failure("trust_lock", err)
-		}
-		if locked {
-			break
-		}
-		select {
-		case <-lockCtx.Done():
-			return failure("trust_busy", lockCtx.Err())
-		case <-time.After(20 * time.Millisecond):
-		}
-	}
-	defer unlock(lock)
+	defer releaseLock(lock)
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -112,6 +94,36 @@ func acceptPolicy(ctx context.Context, root string, c Config, sequence uint64, d
 	return nil
 }
 
+func policyLedgerDirectory(root string, c Config) string {
+	partition := sha256.Sum256([]byte(c.TrustDomain + "\x00" + c.Audience + "\x00" + c.Channel))
+	return filepath.Join(root, "trust", "v1", hex.EncodeToString(partition[:]))
+}
+
+func lockPolicyLedger(ctx context.Context, dir string) (*os.File, error) {
+	lock, err := os.OpenFile(filepath.Join(dir, "ledger.lock"), os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, failure("trust_lock", err)
+	}
+	lockCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	for {
+		locked, err := tryLock(lock)
+		if err != nil {
+			_ = lock.Close()
+			return nil, failure("trust_lock", err)
+		}
+		if locked {
+			return lock, nil
+		}
+		select {
+		case <-lockCtx.Done():
+			_ = lock.Close()
+			return nil, failure("trust_busy", lockCtx.Err())
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+}
+
 func ensureDirectory(dir string) error {
 	info, err := os.Stat(dir)
 	if err == nil {
@@ -155,9 +167,8 @@ func atomicWrite(destination string, data []byte) error {
 }
 
 func ReadAcceptedEnvelope(c Config, root string) ([]byte, error) {
-	partition := sha256.Sum256([]byte(c.TrustDomain + "\x00" + c.Audience + "\x00" + c.Channel))
 	var stored ledger
-	if err := readMetadata(filepath.Join(root, "trust", "v1", hex.EncodeToString(partition[:]), "ledger.json"), &stored); err != nil {
+	if err := readMetadata(filepath.Join(policyLedgerDirectory(root, c), "ledger.json"), &stored); err != nil {
 		return nil, failure("trust_missing", err)
 	}
 	if stored.Version != 1 {

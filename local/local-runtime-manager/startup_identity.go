@@ -298,6 +298,11 @@ func (s *startupIdentityServer) verify(ctx context.Context, flight *startupVerif
 func readServiceStartupIdentity(ctx context.Context, paths RuntimePaths, record *desktopupdate.NativeRecord) (desktopupdate.Config, error) {
 	bounded, cancel := context.WithTimeout(ctx, nativeIdentityTimeout)
 	defer cancel()
+	if record.Mode == "windows-policy" {
+		// The shared Windows observer covers Authenticode's two inputs. The
+		// signed file manifest must be checked with its complete file set.
+		return readNativeConfiguration(bounded, paths)
+	}
 	var hint startupIdentityLocator
 	locator := os.Getenv(startupIdentityEnv)
 	if len(locator) == 0 || len(locator) > 4096 || json.Unmarshal([]byte(locator), &hint) != nil || hint.Address == "" || hint.Manager.PID <= 0 || hint.Manager.StartID == 0 {

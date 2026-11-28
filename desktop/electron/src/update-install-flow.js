@@ -1,4 +1,4 @@
-const { targetComponentRevisions } = require("./update-runtime-client");
+const { targetComponentRevisions, validInstalledManifest, validInstalledManifestPath } = require("./update-runtime-client");
 const failure = code => Object.assign(new Error(code), { code });
 const reasonFor = error => /^[a-z_]{1,64}$/.test(error?.code || "") ? error.code : "update_failed";
 
@@ -141,6 +141,9 @@ function createUpdateInstallFlow({ currentVersion, store, nativeInstaller, runti
       if (!alive(op)) return;
       const selected = context();
       if (!selected.receipt || selected.offer?.next.releaseId !== saved.releaseId) throw failure(getState().reason || "download_not_ready");
+      const windowsPolicy = selected.configuration.mode === "windows-policy";
+      if (windowsPolicy && (!validInstalledManifest(selected.offer.next.installedManifest)
+        || !validInstalledManifestPath(selected.receipt.installedManifestPath))) throw failure("installed_manifest_invalid");
       write({ ...saved, packagePath: selected.receipt.packagePath, dataProfile: selected.receipt.dataProfile });
       publish({ packageAvailable: true, phase: "preparing", pendingDownload: false });
       if (selected.configuration.updaterProtocol === 2) {
@@ -155,7 +158,8 @@ function createUpdateInstallFlow({ currentVersion, store, nativeInstaller, runti
         await verifyComponents(selected.offer.next, selected.receipt);
       }
       if (!alive(op)) return;
-      const stage = await nativeInstaller.prepare({ configuration: selected.configuration, release: selected.offer.next, receipt: selected.receipt });
+      const stage = await nativeInstaller.prepare({ configuration: selected.configuration, release: selected.offer.next, receipt: selected.receipt,
+        ...(windowsPolicy ? { transactionId: saved.transactionId } : {}) });
       if (!alive(op)) return;
       for (;;) {
         publish({ phase: "waiting", secondsRemaining: undefined, reason: undefined });
@@ -182,6 +186,7 @@ function createUpdateInstallFlow({ currentVersion, store, nativeInstaller, runti
         if (!["direct", "bridge"].includes(decision.status) || decision.next?.releaseId !== saved.releaseId
           || decision.next.version !== saved.nextVersion || JSON.stringify(decision.next.package) !== JSON.stringify(selected.offer.next.package)
           || JSON.stringify(decision.next.components) !== JSON.stringify(selected.offer.next.components)
+          || (windowsPolicy && JSON.stringify(decision.next.installedManifest) !== JSON.stringify(selected.offer.next.installedManifest))
           || local.dirty || !local.dataProfile) throw failure("offer_changed");
         const compatible = await verifyComponents(decision.next, selected.receipt);
         if (!alive(op)) return;

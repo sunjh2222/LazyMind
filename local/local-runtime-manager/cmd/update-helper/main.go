@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -30,6 +31,10 @@ func main() {
 		limit = 2 * time.Hour
 	} else if len(os.Args) == 2 && os.Args[1] == "verify-identity" {
 		limit = 75 * time.Second
+	} else if len(os.Args) == 3 && os.Args[1] == "windows-handoff" {
+		limit = 3 * time.Minute
+	} else if len(os.Args) == 3 && os.Args[1] == "windows-handoff-worker" {
+		limit = 2 * time.Hour
 	}
 	ctx, cancel := context.WithTimeout(signals, limit)
 	defer cancel()
@@ -81,10 +86,14 @@ func run(ctx context.Context, args []string, input io.Reader, output io.Writer, 
 			Transactions []summary `json:"transactions"`
 		}{"recovery_status", transactions})
 	}
-	if len(args) != 1 || (args[0] != "config" && args[0] != "check" && args[0] != "discover" && args[0] != "download") {
+	handoff := len(args) == 2 && (args[0] == "windows-handoff" || args[0] == "windows-handoff-worker")
+	if !handoff && (len(args) != 1 || (args[0] != "config" && args[0] != "check" && args[0] != "discover" && args[0] != "download")) {
 		return fmt.Errorf("usage: update-helper config|check|discover|download")
 	}
 	if encodedConfig == "" {
+		if handoff {
+			return &desktopupdate.Failure{Code: "configuration_invalid"}
+		}
 		return json.NewEncoder(output).Encode(map[string]string{"status": "disabled", "reason": "not_configured"})
 	}
 	raw, err := base64.StdEncoding.DecodeString(encodedConfig)
@@ -100,6 +109,9 @@ func run(ctx context.Context, args []string, input io.Reader, output io.Writer, 
 	}
 	if err := desktopupdate.ValidateConfig(config); err != nil {
 		return err
+	}
+	if handoff {
+		return runWindowsHandoff(ctx, args, output, config, trustRoot)
 	}
 	if args[0] == "config" {
 		return json.NewEncoder(output).Encode(struct {
@@ -183,4 +195,22 @@ func decodeInput(raw []byte, target any) error {
 		return fmt.Errorf("extra JSON value")
 	}
 	return nil
+}
+
+// Report a timeout while the installer is still active. Keep the supervisor
+// alive until the child exits so recovery cannot race an unfinished install.
+func waitForWindowsPolicyInstaller(ctx context.Context, wait func() error, markTimeout func(context.Context) error) error {
+	done := make(chan error, 1)
+	go func() { done <- wait() }()
+	select {
+	case err := <-done:
+		if ctx.Err() == nil {
+			return err
+		}
+		return &desktopupdate.Failure{Code: "native_install_timeout", Cause: errors.Join(ctx.Err(), markTimeout(context.WithoutCancel(ctx)))}
+	case <-ctx.Done():
+		err := markTimeout(context.WithoutCancel(ctx))
+		<-done
+		return &desktopupdate.Failure{Code: "native_install_timeout", Cause: errors.Join(ctx.Err(), err)}
+	}
 }

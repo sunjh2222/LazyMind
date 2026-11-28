@@ -51,22 +51,48 @@ func updateBootstrapEnvironment(cfg RuntimeConfig) []string {
 	return []string{"LAZYMIND_UPDATE_BOOTSTRAP_TRANSACTION=" + cfg.UpdateBootstrap.TransactionID, "LAZYMIND_UPDATE_BOOTSTRAP_OWNER=" + cfg.UpdateBootstrap.Owner, "LAZYMIND_UPDATE_BOOTSTRAP_STORAGE=" + string(raw)}
 }
 func readNativeConfiguration(ctx context.Context, paths RuntimePaths) (desktopupdate.Config, error) {
+	return readInstalledUpdateConfiguration(ctx, paths, "verify-identity")
+}
+
+// A config query reads the packaged mode only. A verified identity requires
+// verify-identity, which never accepts a disabled configuration.
+func readInstalledUpdateConfiguration(ctx context.Context, paths RuntimePaths, action string) (desktopupdate.Config, error) {
 	var result struct {
 		Status string
 		Config desktopupdate.Config
 	}
+	root, err := resolveRuntimeRecoveryRoot()
+	if err != nil {
+		return result.Config, err
+	}
 	// Allow the helper's bounded 60-second signature verification to finish.
 	bounded, cancel := context.WithTimeout(ctx, nativeIdentityTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(bounded, filepath.Join(paths.ResourcesRoot, "bin", executableName("lazymind-update-helper")), "verify-identity")
-	raw, err := cmd.Output()
-	if err != nil || len(raw) > 1024*1024 || json.Unmarshal(raw, &result) != nil || result.Status != "enabled" || desktopupdate.ValidateConfig(result.Config) != nil {
+	cmd := exec.CommandContext(bounded, filepath.Join(paths.ResourcesRoot, "bin", executableName("lazymind-update-helper")), action)
+	var output bytes.Buffer
+	cmd.Stdout = &output
+	err = desktopupdate.StartInstalledIdentityHelper(bounded, root, paths.ResourcesRoot, func() error {
+		if err := cmd.Start(); err != nil {
+			return updateStateFailure("native_install_unavailable")
+		}
+		return nil
+	})
+	if err != nil {
+		return result.Config, err
+	}
+	if err := cmd.Wait(); err != nil || output.Len() > 1024*1024 || json.Unmarshal(output.Bytes(), &result) != nil {
+		return result.Config, updateStateFailure("native_install_unavailable")
+	}
+	if action == "config" && result.Status == "disabled" {
+		return desktopupdate.Config{}, nil
+	}
+	if result.Status != "enabled" || desktopupdate.ValidateConfig(result.Config) != nil {
 		return result.Config, updateStateFailure("native_install_unavailable")
 	}
 	return result.Config, nil
 }
 func nativeIdentityMatches(record *desktopupdate.NativeRecord, c desktopupdate.Config, paths RuntimePaths) bool {
-	return c.TrustDomain == record.TrustDomain && c.Audience == record.Audience && c.Channel == record.Channel && c.SigningIdentity == record.SigningIdentity && c.Platform == record.Platform && c.Arch == record.Arch && sameRuntimePath(paths.ResourcesRoot, record.InstallationRoot) && sameRuntimePath(paths.RuntimeRoot, record.RuntimeRoot)
+	return (c.Mode == "windows-policy") == (record.Mode == "windows-policy") && c.TrustDomain == record.TrustDomain && c.Audience == record.Audience && c.Channel == record.Channel && c.SigningIdentity == record.SigningIdentity && c.Platform == record.Platform && c.Arch == record.Arch && sameRuntimePath(paths.ResourcesRoot, record.InstallationRoot) && sameRuntimePath(paths.RuntimeRoot, record.RuntimeRoot)
 }
 func nativeStorageSnapshot(record *desktopupdate.NativeRecord) *UpdateStorageSnapshot {
 	return &UpdateStorageSnapshot{Version: 2, Databases: record.SourceStorage.Databases, SegmentStore: record.SourceStorage.SegmentStore, VectorEngine: record.SourceStorage.VectorEngine, VectorPath: record.SourceStorage.VectorPath, LayoutSource: record.SourceStorage.LayoutSource, OptionalAbsent: append([]string(nil), record.SourceStorage.OptionalAbsent...)}
@@ -540,7 +566,37 @@ func nativeSummary(record *desktopupdate.NativeRecord, owner string) map[string]
 	return view
 }
 
-func (c *CLI) prepareNativeComponents(ctx context.Context, cfg RuntimeConfig, paths RuntimePaths, identity desktopupdate.Config, root, releaseID, packagePath, componentsPath string) (*desktopupdate.NativeRecord, error) {
+func verifyPreparedInstalledManifest(ctx context.Context, root string, identity desktopupdate.Config, path string, artifact *desktopupdate.Artifact, record *desktopupdate.NativeRecord) error {
+	if identity.Mode != "windows-policy" {
+		if path != "" {
+			return updateStateFailure("update_request_invalid")
+		}
+		return nil
+	}
+	if artifact == nil || artifact.Size > desktopupdate.MaxEnvelopeBytes {
+		return updateStateFailure("offer_changed")
+	}
+	if record != nil && (record.InstalledManifestPath != path || record.InstalledManifestSHA256 != artifact.SHA256 || record.InstalledManifestSize != artifact.Size) {
+		return updateStateFailure("offer_changed")
+	}
+	expected := filepath.Join(desktopupdate.DownloadCacheDirectory(root, identity), artifact.SHA256+".json")
+	if !filepath.IsAbs(path) || path != expected {
+		return updateStateFailure("update_request_invalid")
+	}
+	if err := desktopupdate.ValidateWindowsPolicyDownloadCache(root, identity); err != nil {
+		return err
+	}
+	return desktopupdate.VerifyArtifact(ctx, path, *artifact)
+}
+
+func (c *CLI) prepareNativeComponents(ctx context.Context, cfg RuntimeConfig, paths RuntimePaths, identity desktopupdate.Config, root, releaseID, packagePath, componentsPath string, installedManifestPaths ...string) (*desktopupdate.NativeRecord, error) {
+	var manifestPath string
+	if len(installedManifestPaths) != 0 {
+		manifestPath = installedManifestPaths[0]
+	}
+	if manifestPath != "" && identity.Mode != "windows-policy" {
+		return nil, updateStateFailure("update_request_invalid")
+	}
 	record, err := desktopupdate.ReadNativeRecord(root)
 	if err != nil {
 		return nil, err
@@ -551,6 +607,9 @@ func (c *CLI) prepareNativeComponents(ctx context.Context, cfg RuntimeConfig, pa
 		}
 		effective, _, _, _ := record.EffectiveTarget()
 		if record.Phase == "repair" && record.RepairTarget != nil && identity.ReleaseID == effective {
+			if identity.Mode == "windows-policy" {
+				return nil, updateStateFailure("native_install_unavailable")
+			}
 			if len(record.WantedComponents) != 0 {
 				return record, nil
 			}
@@ -582,6 +641,9 @@ func (c *CLI) prepareNativeComponents(ctx context.Context, cfg RuntimeConfig, pa
 		if componentsPath == "" {
 			componentsPath = record.ComponentsPath
 		}
+		if manifestPath == "" {
+			manifestPath = record.InstalledManifestPath
+		}
 	}
 	local, err := sourceUpdateState(ctx, cfg, paths, identity)
 	if err != nil {
@@ -606,6 +668,9 @@ func (c *CLI) prepareNativeComponents(ctx context.Context, cfg RuntimeConfig, pa
 		return nil, updateStateFailure("native_space_unknown")
 	}
 	if err := desktopupdate.VerifyArtifact(ctx, packagePath, target.Package); err != nil {
+		return nil, err
+	}
+	if err := verifyPreparedInstalledManifest(ctx, root, identity, manifestPath, target.InstalledManifest, record); err != nil {
 		return nil, err
 	}
 	_, catalog, err := readTargetCatalog(ctx, componentsPath, target.Components)
@@ -646,6 +711,12 @@ func (c *CLI) prepareNativeComponents(ctx context.Context, cfg RuntimeConfig, pa
 		}
 		hasRAG := slices.Contains(wanted, "rag")
 		record = &desktopupdate.NativeRecord{Version: 2, TransactionID: tx, Phase: "pending", SourceReleaseID: identity.ReleaseID, SourceVersion: identity.Version, TargetReleaseID: target.ID, TargetVersion: target.Version, TrustDomain: identity.TrustDomain, Audience: identity.Audience, Channel: identity.Channel, SigningIdentity: identity.SigningIdentity, Platform: identity.Platform, Arch: identity.Arch, RuntimeRoot: paths.RuntimeRoot, InstallationRoot: paths.ResourcesRoot, Scope: scope, SourceDataProfile: local.DataProfile, TargetDataProfile: decision.Edge.TargetDataProfile, SourceStorage: desktopupdate.NativeStorage{Version: 2, Databases: cloneUpdateStorage(cfg.UpdateStorage).Databases, SegmentStore: cfg.UpdateStorage.SegmentStore, VectorEngine: cfg.ModeProfile.VectorStore.Engine, VectorPath: cfg.ModeProfile.VectorStore.DBPath, LayoutSource: "resolved-runtime", OptionalAbsent: []string{}}, SourceHadRAG: hasRAG, ComponentMode: "absent", ExpectedPeers: peers, PackagePath: packagePath, PackageSHA256: target.Package.SHA256, PackageSize: target.Package.Size, PackageUnpackedBytes: target.Package.UnpackedBytes, ComponentsPath: componentsPath, ComponentsSHA256: target.Components.SHA256, ComponentsSize: target.Components.Size, PolicyDigest: decision.PolicyDigest, PolicySequence: decision.PolicySequence, SourceOwnerDigest: digestOwner(cfg.OwnerToken), SourceActor: &actor}
+		if identity.Mode == "windows-policy" {
+			record.Mode = identity.Mode
+			record.InstalledManifestPath = manifestPath
+			record.InstalledManifestSHA256 = target.InstalledManifest.SHA256
+			record.InstalledManifestSize = target.InstalledManifest.Size
+		}
 		if hasRAG {
 			record.ComponentMode = "sync-target"
 		}
@@ -709,6 +780,35 @@ func digestOwner(owner string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// A still owns failure reporting after it stops its runtime. In an unverified
+// transaction the installed identity helper cannot be executed to authorize it.
+func markWindowsSourceRepair(ctx context.Context, opts RuntimeConfigOptions, tx string) (bool, error) {
+	root, err := resolveRuntimeRecoveryRoot()
+	if err != nil {
+		return true, err
+	}
+	record, err := desktopupdate.ReadNativeRecord(root)
+	if err != nil {
+		return true, err
+	}
+	if record == nil || record.Mode != "windows-policy" || (record.Phase != "installing" && record.Phase != "repair") {
+		return false, nil
+	}
+	resources := firstNonEmpty(opts.ResourcesRoot, os.Getenv(runtimeResourcesRootEnvVar))
+	runtimeRoot := firstNonEmpty(opts.RuntimeRoot, os.Getenv(runtimeRootEnvVar))
+	owner := strings.TrimSpace(firstNonEmpty(opts.OwnerToken, os.Getenv(runtimeOwnerTokenEnvVar)))
+	if tx != record.TransactionID || !sameRuntimePath(resources, record.InstallationRoot) ||
+		(runtimeRoot != "" && !sameRuntimePath(runtimeRoot, record.RuntimeRoot)) ||
+		owner == "" || digestOwner(owner) != record.SourceOwnerDigest || record.SourceActor == nil {
+		return true, updateStateFailure("update_transaction_conflict")
+	}
+	actor, err := desktopupdate.IdentifyProcess(os.Getppid())
+	if err != nil || actor != *record.SourceActor {
+		return true, updateStateFailure("update_transaction_conflict")
+	}
+	return true, desktopupdate.MarkWindowsPolicyHandoffSourceRejected(ctx, root, tx, actor, "update_incomplete")
+}
+
 func (c *CLI) updateBootstrapCommand(ctx context.Context, manager *RuntimeManager, args []string) error {
 	flags := flag.NewFlagSet("update-bootstrap", flag.ContinueOnError)
 	flags.SetOutput(c.errOut)
@@ -718,6 +818,7 @@ func (c *CLI) updateBootstrapCommand(ctx context.Context, manager *RuntimeManage
 	releaseID := flags.String("release-id", "", "")
 	packagePath := flags.String("package", "", "")
 	componentsPath := flags.String("components", "", "")
+	manifestPath := flags.String("installed-manifest", "", "")
 	epoch := flags.Uint64("epoch", 0, "")
 	controlStdin := flags.Bool("control-stdin", false, "")
 	if err := flags.Parse(args); err != nil {
@@ -727,7 +828,13 @@ func (c *CLI) updateBootstrapCommand(ctx context.Context, manager *RuntimeManage
 	blocked := func(err error) error {
 		return emit(map[string]string{"status": "blocked", "reason": desktopupdate.ErrorCode(err)})
 	}
-	if len(flags.Args()) != 0 {
+	var manifestSupplied bool
+	flags.Visit(func(option *flag.Flag) {
+		if option.Name == "installed-manifest" {
+			manifestSupplied = true
+		}
+	})
+	if len(flags.Args()) != 0 || manifestSupplied && (*action != "prepare-components" || *manifestPath == "") {
 		return blocked(updateStateFailure("update_request_invalid"))
 	}
 	if *controlStdin {
@@ -737,6 +844,14 @@ func (c *CLI) updateBootstrapCommand(ctx context.Context, manager *RuntimeManage
 		go func() { var one [1]byte; _, _ = os.Stdin.Read(one[:]); cancel() }()
 	}
 	opts := options()
+	if *action == "repair" && opts.Profile == "desktop" {
+		if handled, err := markWindowsSourceRepair(ctx, opts, *tx); handled {
+			if err != nil {
+				return blocked(err)
+			}
+			return emit(map[string]string{"status": "repair"})
+		}
+	}
 	opts, err := nativeRuntimeOptions(ctx, opts)
 	if err != nil {
 		return blocked(err)
@@ -790,7 +905,7 @@ func (c *CLI) updateBootstrapCommand(ctx context.Context, manager *RuntimeManage
 		if record != nil && *tx != "" && *tx != record.TransactionID {
 			return blocked(updateStateFailure("update_transaction_conflict"))
 		}
-		prepared, err := c.prepareNativeComponents(ctx, cfg, paths, identity, root, *releaseID, *packagePath, *componentsPath)
+		prepared, err := c.prepareNativeComponents(ctx, cfg, paths, identity, root, *releaseID, *packagePath, *componentsPath, *manifestPath)
 		if err != nil {
 			return blocked(err)
 		}
@@ -830,6 +945,9 @@ func (c *CLI) updateBootstrapCommand(ctx context.Context, manager *RuntimeManage
 			return blocked(updateStateFailure("offer_changed"))
 		}
 		if err := desktopupdate.VerifyArtifact(ctx, record.PackagePath, decision.Next.Package); err != nil {
+			return blocked(err)
+		}
+		if err := verifyPreparedInstalledManifest(ctx, root, identity, record.InstalledManifestPath, decision.Next.InstalledManifest, record); err != nil {
 			return blocked(err)
 		}
 		_, catalog, err := readTargetCatalog(ctx, record.ComponentsPath, decision.Next.Components)

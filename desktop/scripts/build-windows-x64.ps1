@@ -1,8 +1,9 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('build', 'installer', 'resume', 'resume-installer', 'doctor', 'clean', 'clean-all')]
-    [string]$Action = 'build'
+    [ValidateSet('build', 'installer', 'stage-policy-installer', 'pack-policy-installer', 'resume', 'resume-installer', 'doctor', 'clean', 'clean-all')]
+    [string]$Action = 'build',
+    [string]$Prepackaged
 )
 
 $ErrorActionPreference = 'Stop'
@@ -195,14 +196,20 @@ function Invoke-NativeWithRetry(
     }
 }
 
-function Invoke-WindowsPackagingWithRetry([ValidateSet('zip', 'nsis')][string]$Target) {
+function Invoke-WindowsPackagingWithRetry([ValidateSet('zip', 'nsis', 'dir')][string]$Target, [string]$Prepackaged) {
     $maximumAttempts = 3
     for ($attempt = 1; $attempt -le $maximumAttempts; $attempt++) {
         try {
             # pnpm run sets npm_execpath to pnpm.cjs, which electron-builder 24's
             # native rebuilder tries to execute as a Windows binary. pnpm exec
             # launches the same CLI without that lifecycle-script environment.
-            Invoke-Native 'pnpm.cmd' @('exec', 'electron-builder', '--config', 'electron-builder.config.cjs', '--win', $Target, '--x64', '--publish', 'never') $electronRoot
+            if ($Prepackaged) {
+                Invoke-Native 'pnpm.cmd' @('exec', 'electron-builder', '--config', 'electron-builder.config.cjs', '--win', 'nsis', '--x64', '--prepackaged', $Prepackaged, '--publish', 'never') $electronRoot
+            } elseif ($Target -eq 'dir') {
+                Invoke-Native 'pnpm.cmd' @('exec', 'electron-builder', '--config', 'electron-builder.config.cjs', '--win', '--x64', '--dir', '--publish', 'never') $electronRoot
+            } else {
+                Invoke-Native 'pnpm.cmd' @('exec', 'electron-builder', '--config', 'electron-builder.config.cjs', '--win', $Target, '--x64', '--publish', 'never') $electronRoot
+            }
             return
         } catch {
             if ($attempt -eq $maximumAttempts) {
@@ -211,18 +218,23 @@ function Invoke-WindowsPackagingWithRetry([ValidateSet('zip', 'nsis')][string]$T
             $delaySeconds = 10 * $attempt
             Write-Warning "Windows packaging attempt $attempt/$maximumAttempts failed: $($_.Exception.Message)"
             Write-Host "Retrying Windows packaging in $delaySeconds seconds; completed Electron and builder downloads remain cached."
-            Remove-GeneratedPath (Join-Path $distRoot 'win-unpacked')
+            if (-not $Prepackaged) {
+                Remove-GeneratedPath (Join-Path $distRoot 'win-unpacked')
+            }
             Remove-GeneratedPath (Join-Path $distRoot 'LazyMind-windows-x64-installer.exe')
             Start-Sleep -Seconds $delaySeconds
         }
     }
 }
 
-function Build-GoBinary([string]$Directory, [string]$Output, [string[]]$Package = @('.'), [switch]$WindowsGUI) {
+function Build-GoBinary([string]$Directory, [string]$Output, [string[]]$Package = @('.'), [switch]$WindowsGUI, [string]$UpdateConfiguration) {
     New-Item -ItemType Directory -Force -Path (Split-Path $Output) | Out-Null
     $buildArgs = $goBuildArgs
     if ($WindowsGUI) {
         $buildArgs = @('-trimpath', '-buildvcs=false', '-ldflags=-s -w -H=windowsgui')
+        if ($UpdateConfiguration) {
+            $buildArgs[2] += " -X main.embeddedConfig=$UpdateConfiguration"
+        }
     }
     Invoke-NativeWithRetry 'Go module download/build' 'go.exe' (@('build') + $buildArgs + @('-o', $Output) + $Package) $Directory
 }
@@ -405,19 +417,49 @@ function Assert-WindowsPythonComponent {
 
 function Assert-UpdateBuildConfiguration {
     $updateSigningMode = if ($env:WIN_CSC_LINK -or $env:CSC_LINK) { 'authenticode' } else { 'none' }
-    Invoke-Native 'node.exe' @(
+    $updateArguments = @(
         (Join-Path $repoRoot 'desktop\scripts\prepare-update-build-config.mjs'),
         '--platform', 'windows', '--arch', 'amd64', '--signing-mode', $updateSigningMode,
-        '--package', (Join-Path $electronRoot 'package.json'),
-        '--verify-helper', (Join-Path $runtimeRoot 'bin\lazymind-update-helper.exe')
+        '--package', (Join-Path $electronRoot 'package.json')
     )
+    Invoke-Native 'node.exe' ($updateArguments + @('--verify-helper', (Join-Path $runtimeRoot 'bin\lazymind-update-helper.exe')))
+    $configuration = & node.exe @updateArguments
+    if ($LASTEXITCODE -ne 0) { throw 'Unable to prepare public update build configuration' }
+    return ($configuration -join '').Trim()
 }
 
-function Finalize-Desktop([ValidateSet('zip', 'installer')][string]$PackageKind = 'zip') {
+function Move-FinalWindowsInstaller {
+    $builderInstaller = Join-Path $distRoot 'LazyMind-windows-x64-installer.exe'
+    $finalInstaller = Join-Path $distRoot (New-WindowsInstallerFileName)
+    if (-not (Test-Path -LiteralPath $builderInstaller -PathType Leaf)) {
+        throw "Electron Builder did not produce $builderInstaller"
+    }
+    Move-Item -LiteralPath $builderInstaller -Destination $finalInstaller -Force
+    Write-Host "Windows installer: $finalInstaller"
+}
+
+function Pack-SealedWindowsInstaller([string]$Prepackaged) {
+    $expected = Join-Path $distRoot 'win-unpacked'
+    if (-not $Prepackaged -or [IO.Path]::GetFullPath($Prepackaged) -ne $expected -or $env:WIN_CSC_LINK -or $env:CSC_LINK) {
+        throw 'Expected the sealed Windows policy application and no Authenticode inputs'
+    }
+    Invoke-Native 'node.exe' @((Join-Path $repoRoot 'desktop\scripts\windows-policy-release.mjs'), '--app-root', $Prepackaged, '--verify')
+    Invoke-WindowsPackagingWithRetry 'nsis' -Prepackaged $Prepackaged
+    Move-FinalWindowsInstaller
+}
+
+function Finalize-Desktop([ValidateSet('zip', 'installer', 'policy-stage')][string]$PackageKind = 'zip') {
     # Resume must not stamp a new identity onto old staged binaries. Re-evaluate
     # the current config/signing route, compare the helper, and require rebuild
     # on any change, before staging or packaging mutates the previous output.
-    Assert-UpdateBuildConfiguration
+    $updateConfig = Assert-UpdateBuildConfiguration
+    $windowsPolicy = $false
+    if ($updateConfig) {
+        $windowsPolicy = ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($updateConfig)) | ConvertFrom-Json).mode -eq 'windows-policy'
+    }
+    if ($windowsPolicy -ne ($PackageKind -eq 'policy-stage')) {
+        throw 'A Windows policy installer requires the separate stage, seal and prepackaged actions'
+    }
     $finalZipName = New-WindowsZipFileName
     Materialize-PythonAliases
     Prune-PythonTree (Join-Path $runtimeRoot 'runtimes\python')
@@ -476,14 +518,15 @@ function Finalize-Desktop([ValidateSet('zip', 'installer')][string]$PackageKind 
         (Join-Path $electronRoot 'assets\LazyMind.icns'),
         $env:LAZYMIND_DESKTOP_WINDOWS_ICON
     )
-    Build-GoBinary (Join-Path $repoRoot 'local\local-runtime-manager') $desktopLauncherPath @('.\cmd\desktop-launcher') -WindowsGUI
+    $launcherConfig = if ($windowsPolicy) { $updateConfig } else { '' }
+    Build-GoBinary (Join-Path $repoRoot 'local\local-runtime-manager') $desktopLauncherPath @('.\cmd\desktop-launcher') -WindowsGUI -UpdateConfiguration $launcherConfig
     Assert-WindowsGUISubsystem $desktopLauncherPath
     Invoke-NativeWithRetry 'Electron dependency install' 'pnpm.cmd' @('install', '--frozen-lockfile', '--prefer-offline') $electronRoot
     Remove-GeneratedPath (Join-Path $distRoot 'win-unpacked')
     Remove-GeneratedPath (Join-Path $distRoot 'LazyMind-win-x64.zip')
     Remove-GeneratedPath (Join-Path $distRoot 'LazyMind-windows-x64.zip')
     Remove-GeneratedPath (Join-Path $distRoot 'LazyMind-windows-x64-installer.exe')
-    if ($PackageKind -eq 'installer') {
+    if ($PackageKind -ne 'zip') {
         Remove-GeneratedPath $installerResourcesRoot
         New-Item -ItemType Directory -Force -Path $installerResourcesRoot | Out-Null
         $longestRuntimeRelativePath = Get-ChildItem -LiteralPath $runtimeRoot -Recurse -File |
@@ -502,14 +545,12 @@ function Finalize-Desktop([ValidateSet('zip', 'installer')][string]$PackageKind 
         Set-Content -LiteralPath (Join-Path $installerResourcesRoot 'lazymind-installer-metadata.nsh') -Value $installerMetadata -NoNewline
         Build-GoBinary (Join-Path $repoRoot 'local\local-runtime-manager') (Join-Path $installerResourcesRoot 'lazymind-installer-maintenance.exe') @('.\cmd\installer-maintenance')
         $env:LAZYMIND_DESKTOP_RUNTIME_STAGE = New-DeferredPythonRuntimeStage
-        Invoke-WindowsPackagingWithRetry 'nsis'
-        $builderInstaller = Join-Path $distRoot 'LazyMind-windows-x64-installer.exe'
-        $finalInstaller = Join-Path $distRoot (New-WindowsInstallerFileName)
-        if (-not (Test-Path -LiteralPath $builderInstaller -PathType Leaf)) {
-            throw "Electron Builder did not produce $builderInstaller"
+        if ($windowsPolicy) {
+            Invoke-WindowsPackagingWithRetry 'dir'
+            return
         }
-        Move-Item -LiteralPath $builderInstaller -Destination $finalInstaller -Force
-        Write-Host "Windows installer: $finalInstaller"
+        Invoke-WindowsPackagingWithRetry 'nsis'
+        Move-FinalWindowsInstaller
         return
     }
     Invoke-WindowsPackagingWithRetry 'zip'
@@ -529,7 +570,7 @@ function Finalize-Desktop([ValidateSet('zip', 'installer')][string]$PackageKind 
     Write-Host "Portable ZIP: $finalZip"
 }
 
-function Build-Desktop([ValidateSet('zip', 'installer')][string]$PackageKind = 'zip') {
+function Build-Desktop([ValidateSet('zip', 'installer', 'policy-stage')][string]$PackageKind = 'zip') {
     Invoke-Doctor
     Remove-GeneratedPath $targetRoot
     New-Item -ItemType Directory -Force -Path (Join-Path $runtimeRoot 'bin') | Out-Null
@@ -650,6 +691,8 @@ switch ($Action) {
     'doctor' { Invoke-Doctor }
     'build' { Build-Desktop }
     'installer' { Build-Desktop 'installer' }
+    'stage-policy-installer' { Build-Desktop 'policy-stage' }
+    'pack-policy-installer' { Pack-SealedWindowsInstaller $Prepackaged }
     'resume' { Invoke-Doctor; Finalize-Desktop }
     'resume-installer' { Invoke-Doctor; Finalize-Desktop 'installer' }
     'clean' {

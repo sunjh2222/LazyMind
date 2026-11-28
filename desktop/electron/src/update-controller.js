@@ -1,5 +1,6 @@
 const { isTrustedNotificationSender } = require("./native-notifications");
 const { createUpdateInstallFlow } = require("./update-install-flow");
+const { validInstalledManifest, validInstalledManifestPath } = require("./update-runtime-client");
 const clone = (value) => JSON.parse(JSON.stringify(value));
 const failure = (code) => Object.assign(new Error(code), { code });
 const reasonFor = (error) => /^[a-z_]{1,64}$/.test(error?.code || "") ? error.code : "check_failed";
@@ -28,6 +29,7 @@ function createDesktopUpdater({ currentVersion, invokeHelper, readLocalState, re
   const offerFields = () => offer ? { releaseId: offer.next.releaseId, nextVersion: offer.next.version,
     targetVersion: offer.targetVersion || offer.next.version, route: [...offer.route], downloadedBytes: 0,
     totalBytes: offer.next.package.size + (offer.next.components?.size || 0)
+      + (config?.config?.mode === "windows-policy" ? offer.next.installedManifest.size : 0)
       + (config?.config?.updaterProtocol === 2 ? 0 : offer.next.feed?.size || 0) } : clearOffer();
 
   const check = (continuing = false, explicit = false) => {
@@ -57,6 +59,7 @@ function createDesktopUpdater({ currentVersion, invokeHelper, readLocalState, re
           if (!decision.next || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(decision.next.releaseId || "")
             || typeof decision.next.version !== "string" || !Array.isArray(decision.route) || decision.route[0] !== decision.next.releaseId
             || !Number.isSafeInteger(decision.next.package?.size) || decision.next.package.size <= 0) throw failure("helper_protocol");
+          if (config.config.mode === "windows-policy" && !validInstalledManifest(decision.next.installedManifest)) throw failure("helper_protocol");
           offer = clone(decision);
           const fields = offerFields(); if (!Number.isSafeInteger(fields.totalBytes)) throw failure("helper_protocol");
           publish({ ...fields, phase: "available", reason: "compatible", channel: config.config.channel });
@@ -90,6 +93,7 @@ function createDesktopUpdater({ currentVersion, invokeHelper, readLocalState, re
           onProgress: (progress) => { if (!disposed && active === operation && !operation.cancelled) publish({ phase: "downloading", downloadedBytes: progress.downloadedBytes, totalBytes: progress.totalBytes }); } });
         if (operation.cancelled || disposed) return;
         if (result.status !== "downloaded" || result.releaseId !== releaseId || typeof result.packagePath !== "string" || !result.packagePath) throw failure("helper_protocol");
+        if (config.config.mode === "windows-policy" && !validInstalledManifestPath(result.installedManifestPath)) throw failure("helper_protocol");
         // Keep the measured source profile with the private receipt so even a
         // pre-install recovery failure can later confirm a manual repair.
         receipt = { ...result, dataProfile: local.dataProfile };

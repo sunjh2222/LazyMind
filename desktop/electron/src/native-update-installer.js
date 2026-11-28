@@ -6,6 +6,7 @@ const { spawn: spawnProcess } = require("node:child_process");
 
 const failure = (code, handoffStarted = false) => Object.assign(new Error(code), { code, handoffStarted });
 const id = value => typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value);
+const stableVersion = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
 
 async function verifiedFile(filename, expected) {
   let file;
@@ -68,10 +69,16 @@ function createNativeUpdateInstaller({ platform = process.platform, arch = proce
   const nativeArch = arch === "x64" ? "amd64" : arch;
   const capability = configuration => {
     try {
-      if (disposed || !isPackaged || !["win32", "darwin"].includes(platform) || configuration?.mode !== "official"
+      if (disposed || !isPackaged || !["win32", "darwin"].includes(platform)
         || configuration.version !== currentVersion || configuration.platform !== nativePlatform || configuration.arch !== nativeArch
         || ![1, 2].includes(configuration.updaterProtocol) || ![configuration.trustDomain, configuration.audience, configuration.channel, configuration.releaseId].every(id)
         || typeof configuration.signingIdentity !== "string" || !configuration.signingIdentity.trim()) throw new Error();
+      if (configuration.mode === "windows-policy") {
+        if (platform !== "win32" || arch !== "x64" || configuration.updaterProtocol !== 2
+          || configuration.audience !== "official" || configuration.channel !== "stable" || !stableVersion.test(currentVersion)) throw new Error();
+        return { supported: true };
+      }
+      if (configuration.mode !== "official") throw new Error();
       const filename = path.join(resourcesPath, "app-update.yml");
       const stat = fs.lstatSync(filename);
       if (!stat.isFile() || stat.size > 64 * 1024) throw new Error();
@@ -121,6 +128,51 @@ function createNativeUpdateInstaller({ platform = process.platform, arch = proce
     } catch { finish(failure("native_install_failed")); }
   });
 
+  const windowsPolicyInstall = transactionId => new Promise((resolve, reject) => {
+    let child, spawned = false, settled = false, frame = Buffer.alloc(0);
+    const finish = error => {
+      if (settled) return;
+      settled = true; clearTimeout(timer); cancelHandoff = undefined;
+      if (!error || error.handoffStarted) terminal = true;
+      child?.stdout?.removeListener("data", read);
+      child?.stdout?.destroy();
+      child?.unref();
+      if (error) { reject(error); return; }
+      try { setQuitting(true); quit(); resolve({ handoff: true }); }
+      catch { reject(failure("native_handoff_unknown", true)); }
+    };
+    const unknown = () => finish(failure("native_handoff_unknown", true));
+    const read = chunk => {
+      const newline = chunk.indexOf(10);
+      const next = newline < 0 ? chunk : chunk.subarray(0, newline);
+      if (frame.length + next.length > 4096) { unknown(); return; }
+      frame = Buffer.concat([frame, next]);
+      if (newline < 0) return;
+      let message;
+      try { message = JSON.parse(frame.toString("utf8")); }
+      catch { unknown(); return; }
+      if (message?.status === "check_failed" && /^[a-z_]{1,64}$/.test(message.reason || "")) {
+        finish(failure(message.reason, true)); return;
+      }
+      if (message?.status !== "handoff_accepted" || message.transactionId !== transactionId) { unknown(); return; }
+      finish();
+    };
+    const timer = setTimeout(unknown, handoffTimeoutMs);
+    cancelHandoff = unknown;
+    try {
+      const helper = path.join(resourcesPath, "runtime", "bin", "lazymind-update-helper.exe");
+      child = spawn(helper, ["windows-handoff", transactionId], { shell: false, detached: true, windowsHide: true, stdio: ["ignore", "pipe", "ignore"] });
+      child.once("spawn", () => { spawned = true; });
+      child.once("error", () => spawned ? unknown() : finish(failure("native_install_failed")));
+      // A clean exit can precede delivery of its final stdout bytes.
+      child.once("exit", code => { if (code !== 0) unknown(); });
+      child.once("close", unknown);
+      child.stdout.once("end", unknown);
+      child.stdout.once("error", unknown);
+      child.stdout.on("data", read);
+    } catch { if (child) unknown(); else finish(failure("native_install_failed")); }
+  });
+
   // electron-updater 6.6.2's quitAndInstall registers an anonymous native
   // downloaded callback. Own that one callback so a cancelled attempt cannot
   // install later; retain its handleUpdateDownloaded implementation unchanged.
@@ -161,45 +213,53 @@ function createNativeUpdateInstaller({ platform = process.platform, arch = proce
 
   return {
     capability,
-    async prepare({ configuration, release, receipt }) {
+    async prepare({ configuration, release, receipt, transactionId }) {
       if (!capability(configuration).supported) throw failure("native_install_unavailable");
       if (preparing || installing || terminal) throw failure("native_update_busy");
       if (!release || !id(release.releaseId) || typeof release.version !== "string" || !release.version || release.version.length > 128
         || release.platform !== configuration.platform || release.arch !== configuration.arch || release.signingIdentity !== configuration.signingIdentity
         || receipt?.releaseId !== release.releaseId || receipt.version !== release.version) throw failure("native_identity_mismatch");
+      const windowsPolicy = configuration.mode === "windows-policy";
+      if (windowsPolicy && (typeof transactionId !== "string" || !/^[a-f0-9]{32}$/.test(transactionId)
+        || !stableVersion.test(release.version) || typeof receipt.packagePath !== "string" || !path.isAbsolute(receipt.packagePath)
+        || receipt.packagePath.includes("\0"))) throw failure("native_identity_mismatch");
       const selected = { releaseId: release.releaseId, version: release.version, arch: release.arch };
       const expected = { sha256: release.package?.sha256, size: release.package?.size };
       preparing = true; currentStage = undefined;
       let source, feed;
       try {
-        source = await verifiedFile(receipt.packagePath, expected);
+        if (!windowsPolicy) source = await verifiedFile(receipt.packagePath, expected);
         await spaceFor(configuration, release, receipt.packagePath);
         if (disposed) throw failure("native_install_unavailable");
-        if (!updater) {
-          updater = createUpdater ? createUpdater() : new (require("electron-updater")[platform === "win32" ? "NsisUpdater" : "MacUpdater"])();
-          updater.logger = null;
-          // The library has its own error listener in production; retain a
-          // handler for late native events even after a handoff has failed.
-          updater.on("error", () => {});
+        let filename = receipt.packagePath;
+        if (!windowsPolicy) {
+          if (!updater) {
+            updater = createUpdater ? createUpdater() : new (require("electron-updater")[platform === "win32" ? "NsisUpdater" : "MacUpdater"])();
+            updater.logger = null;
+            // The library has its own error listener in production; retain a
+            // handler for late native events even after a handoff has failed.
+            updater.on("error", () => {});
+          }
+          updater.autoDownload = false; updater.autoInstallOnAppQuit = false;
+          // MacUpdater uses this flag to choose native quitAndInstall over plain
+          // app.quit. Windows relaunch is explicit in our fixed NSIS arguments.
+          updater.autoRunAppAfterInstall = platform === "darwin";
+          updater.channel = "latest"; updater.allowPrerelease = true; updater.allowDowngrade = false;
+          updater.disableWebInstaller = true; updater.disableDifferentialDownload = true;
+          await updater.netSession.setProxy({ mode: "direct" });
+          feed = await privateFeed(source, selected, platform);
+          closeFeed = feed.close;
+          updater.requestHeaders = feed.headers;
+          updater.setFeedURL({ provider: "generic", url: feed.url });
+          const result = await updater.checkForUpdates();
+          if (disposed || result?.isUpdateAvailable !== true || result.updateInfo?.version !== selected.version) throw failure("native_identity_mismatch");
+          const files = await updater.downloadUpdate();
+          if (disposed || !Array.isArray(files) || files.length !== 1 || typeof files[0] !== "string") throw failure("native_prepare_failed");
+          const verified = await verifiedFile(files[0], expected);
+          await verified.file.close();
+          filename = files[0];
         }
-        updater.autoDownload = false; updater.autoInstallOnAppQuit = false;
-        // MacUpdater uses this flag to choose native quitAndInstall over plain
-        // app.quit. Windows relaunch is explicit in our fixed NSIS arguments.
-        updater.autoRunAppAfterInstall = platform === "darwin";
-        updater.channel = "latest"; updater.allowPrerelease = true; updater.allowDowngrade = false;
-        updater.disableWebInstaller = true; updater.disableDifferentialDownload = true;
-        await updater.netSession.setProxy({ mode: "direct" });
-        feed = await privateFeed(source, selected, platform);
-        closeFeed = feed.close;
-        updater.requestHeaders = feed.headers;
-        updater.setFeedURL({ provider: "generic", url: feed.url });
-        const result = await updater.checkForUpdates();
-        if (disposed || result?.isUpdateAvailable !== true || result.updateInfo?.version !== selected.version) throw failure("native_identity_mismatch");
-        const files = await updater.downloadUpdate();
-        if (disposed || !Array.isArray(files) || files.length !== 1 || typeof files[0] !== "string") throw failure("native_prepare_failed");
-        const verified = await verifiedFile(files[0], expected);
-        await verified.file.close();
-        const stage = { filename: files[0], attempt: null };
+        const stage = { filename, attempt: null };
         currentStage = stage;
         return { install() {
           if (stage.attempt) return stage.attempt;
@@ -208,6 +268,10 @@ function createNativeUpdateInstaller({ platform = process.platform, arch = proce
             installing = true;
             try {
               await spaceFor(configuration, release, stage.filename);
+              if (windowsPolicy) {
+                if (disposed || currentStage !== stage) throw failure("native_install_unavailable");
+                return await windowsPolicyInstall(transactionId);
+              }
               const final = await verifiedFile(stage.filename, expected);
               await final.file.close();
               if (disposed || currentStage !== stage) throw failure("native_install_unavailable");

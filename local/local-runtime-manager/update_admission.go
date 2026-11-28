@@ -68,7 +68,7 @@ func checkRuntimeUpdateAdmission(ctx context.Context, cfg RuntimeConfig, paths R
 	if err != nil {
 		return err
 	}
-	return desktopupdate.CheckStartup(ctx, root, scope)
+	return desktopupdate.CheckRuntimeUpdateAdmission(ctx, root, scope)
 }
 func registerDesktopUpdateCoordinator(ctx context.Context, cfg RuntimeConfig, paths RuntimePaths) error {
 	if err := nativeShellStartup(ctx, cfg, paths); err != nil {

@@ -15,7 +15,7 @@ HERE = Path(__file__).resolve().parent
 SMOKE = runpy.run_path(str(HERE / 'smoke-published-upgrade.py'))
 PROBE = runpy.run_path(str(HERE / 'verify-update-format.py'))
 PLAN = runpy.run_path(str(HERE / 'prepare-update-ci-plan.py'))
-require, load = SMOKE['require'], SMOKE['read_json']
+require, load, progress = SMOKE['require'], SMOKE['read_json'], SMOKE['progress']
 
 
 def baseline(verification, platform):
@@ -78,24 +78,26 @@ def run_native(args):
         publisher = PLAN['publisher']
         origins = {origin.rstrip('/') for origin in actual['allowedOrigins']}
         opener = build_opener(publisher.PinnedRedirects(origins))
-        signed = publisher.read_remote_policy(lambda url: opener.open(url, timeout=60), actual['policyURL'])
-        require(signed is not None, 'Published policy disappeared')
-        envelope = work / 'public-policy.json'
-        envelope.write_bytes(signed)
-        verified = subprocess.run([str(args.validator.resolve()), 'verify', '--config', str(config), '--envelope', str(envelope)],
-                                  capture_output=True, text=True, check=True, timeout=30)
-        policy = json.loads(verified.stdout)
-        a, b = (r['release']['releaseId'] for r in (source, target))
-        releases = {r['releaseId']: r for r in policy['releases']}
-        require(releases.get(a) == source['release'] and releases.get(b) == target['release'] and
-                not {a, b}.intersection(policy['revoked'] or []) and
-                any(e['sourceReleaseId'] == a and e['targetReleaseId'] == b for e in policy['edges']),
-                'The live signed policy does not authorize this native A -> B')
+        with progress('Fetch and verify published A to B policy'):
+            signed = publisher.read_remote_policy(lambda url: opener.open(url, timeout=60), actual['policyURL'])
+            require(signed is not None, 'Published policy disappeared')
+            envelope = work / 'public-policy.json'
+            envelope.write_bytes(signed)
+            verified = subprocess.run([str(args.validator.resolve()), 'verify', '--config', str(config), '--envelope', str(envelope)],
+                                      capture_output=True, text=True, check=True, timeout=30)
+            policy = json.loads(verified.stdout)
+            a, b = (r['release']['releaseId'] for r in (source, target))
+            releases = {r['releaseId']: r for r in policy['releases']}
+            require(releases.get(a) == source['release'] and releases.get(b) == target['release'] and
+                    not {a, b}.intersection(policy['revoked'] or []) and
+                    any(e['sourceReleaseId'] == a and e['targetReleaseId'] == b for e in policy['edges']),
+                    'The live signed policy does not authorize this native A -> B')
 
         source_dir, target_dir = work / 'source', work / 'target'
         source_dir.mkdir()
         target_dir.mkdir()
-        PROBE['download_source'](source['release'], target, source_dir)
+        with progress('Download published A package and component catalog'):
+            PROBE['download_source'](source['release'], target, source_dir)
         (source_dir / 'release.json').write_text(json.dumps(source), encoding='utf-8')
         (target_dir / 'release.json').write_text(json.dumps(target), encoding='utf-8')
         # Older releases expose only RAG. Exercise the optional capabilities A

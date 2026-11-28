@@ -458,6 +458,12 @@ func stageTargetComponentIn(ctx context.Context, environment PythonComponentMain
 	} else if !os.IsNotExist(err) {
 		return result, invalid
 	}
+	return downloadTargetComponentIn(ctx, environment, root, target, stageDir)
+}
+
+func downloadTargetComponentIn(ctx context.Context, environment PythonComponentMaintenanceContext, root *os.Root, target PythonComponent, stageDir string) (result componentMaintenanceStageItem, stageErr error) {
+	result = componentMaintenanceStageItem{Revision: target.Revision, SHA256: target.SHA256}
+	invalid := errors.New("component_state_unknown")
 	free, err := componentFreeSpace(environment.RuntimeRoot)
 	required := uint64(target.SizeBytes) + uint64(target.UnpackedBytes) + 256*1024*1024
 	if err != nil || free < required {

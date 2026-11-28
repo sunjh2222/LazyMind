@@ -257,7 +257,7 @@ func proveSharedKey(previous update.Policy, config update.Config, keyID, directo
 		}
 		prior, ok := missing[source.Release.ID]
 		c := source.Config
-		if !ok || source.Release != prior || c.ReleaseID != prior.ID || c.Version != prior.Version ||
+		if !ok || !reflect.DeepEqual(source.Release, prior) || c.ReleaseID != prior.ID || c.Version != prior.Version ||
 			c.Platform != prior.Platform || c.Arch != prior.Arch || c.SigningIdentity != prior.SigningIdentity ||
 			c.TrustDomain != config.TrustDomain || c.Channel != config.Channel || c.Audience != config.Audience ||
 			c.PolicyURL != config.PolicyURL || c.Mode != config.Mode || c.PublicKeys[keyID] != expectedKey {
@@ -290,7 +290,7 @@ func extendPublication(previous, next update.Policy) (update.Policy, error) {
 	releases := slices.Clone(previous.Releases)
 	for _, release := range next.Releases {
 		if existing, found := published[release.ID]; found {
-			if release != existing {
+			if !reflect.DeepEqual(release, existing) {
 				return next, errors.New("source release record does not match published policy")
 			}
 			continue

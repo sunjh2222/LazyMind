@@ -1,0 +1,183 @@
+name: Validate Windows package
+
+on:
+  push:
+    branches:
+      - ci/windows-update-validation
+  workflow_dispatch:
+    inputs:
+      package:
+        description: Build the baseline A or the update candidate B
+        type: choice
+        default: A
+        options: [A, B]
+      skip_upgrade_checks:
+        description: Skip the native handoff, recovery, and identity test fixtures
+        type: boolean
+        default: true
+
+jobs:
+  package:
+    if: github.repository == 'sunjh2222/LazyMind' && github.ref == 'refs/heads/ci/windows-update-validation'
+    runs-on: windows-2025
+    environment: desktop_updates_test
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CI: 'true'
+      MIRROR_PROFILE: intl
+      NPM_CONFIG_REGISTRY: https://registry.npmjs.org
+      GOPROXY: https://proxy.golang.org,direct
+      PIP_INDEX_URL: https://pypi.org/simple
+      UV_DEFAULT_INDEX: https://pypi.org/simple
+      LAZYMIND_RELEASE_BUILD: 'true'
+      LAZYMIND_DESKTOP_DEFER_CLUSTER: 'true'
+      VALIDATION_BASE_URL: https://modelscope.cn/datasets/sunjh2222/lazymind-updates/resolve/master/updates/windows-policy-validation/v1/
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+          package-manager-cache: false
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.27.3'
+          cache: false
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: '0.11.31'
+          enable-cache: false
+
+      - name: Enable pnpm
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          corepack enable
+          corepack prepare pnpm@10.0.0 --activate
+          pnpm --version
+
+      - name: Run native Windows handoff, recovery, and identity fixtures
+        if: github.event_name == 'workflow_dispatch' && !inputs.skip_upgrade_checks
+        working-directory: local/local-runtime-manager
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          go test ./internal/desktopupdate ./cmd/update-helper -run '^TestWindowsPolicy(PackagedHandoffWaitsForInstallerExit|PublicLauncherVerifiesRecoveryBeforeCreatingAppProcess|VerifyIdentityCLI)$' -count=1 -v
+
+      - name: Configure public validation trust and version
+        id: validation
+        env:
+          VALIDATION_PACKAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.package || 'A' }}
+          VALIDATION_TEST_CONFIG: ${{ vars.LAZYMIND_WINDOWS_TEST_UPDATE_CONFIG_JSON }}
+          VALIDATION_KEY_ID: ${{ vars.LAZYMIND_WINDOWS_TEST_UPDATE_POLICY_KEY_ID }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $version = switch ($env:VALIDATION_PACKAGE) {
+            'A' { '0.5.401' }
+            'B' { '0.5.402' }
+            default { throw 'Expected validation package A or B' }
+          }
+          node desktop/scripts/resolve-release-version.mjs --tag "v$version" --package desktop/electron/package.json
+          $env:VALIDATION_CONFIG_PATH = Join-Path $env:RUNNER_TEMP 'validation-update-config.json'
+          @'
+          import { writeFileSync } from 'node:fs';
+
+          const template = JSON.parse(process.env.VALIDATION_TEST_CONFIG || 'null');
+          const base = new URL(process.env.VALIDATION_BASE_URL);
+          const dataset = new URL('../../..', base).href;
+          const oldPolicy = template?.policyURL;
+          if (typeof oldPolicy !== 'string' || !oldPolicy.startsWith(dataset)
+            || !/^updates\/windows-test\/(?:[A-Za-z0-9][A-Za-z0-9._-]*\/)+policy\.json$/.test(oldPolicy.slice(dataset.length))
+            || !Array.isArray(template.allowedOrigins) || !template.allowedOrigins.includes(base.origin)) {
+            throw new Error('Validation requires the existing test signer for the same ModelScope dataset');
+          }
+          const keyId = process.env.VALIDATION_KEY_ID;
+          const publicKey = template.publicKeys?.[keyId];
+          if (!keyId || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(keyId)
+            || typeof publicKey !== 'string' || !/^[A-Za-z0-9+/]{43}=$/.test(publicKey)) {
+            throw new Error('Missing matching test Ed25519 public key');
+          }
+          const configuration = {
+            trustDomain: 'windows-policy-validation-v1',
+            audience: 'official',
+            channel: 'stable',
+            mode: 'windows-policy',
+            signingIdentity: 'WINDOWS_POLICY_VALIDATION',
+            updaterProtocol: 2,
+            policyURL: new URL('policy.json', base).href,
+            allowedOrigins: template.allowedOrigins,
+            publicKeys: { [keyId]: publicKey },
+          };
+          writeFileSync(process.env.VALIDATION_CONFIG_PATH, JSON.stringify(configuration), { flag: 'wx' });
+          '@ | node --input-type=module -
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Stage the Windows update application
+        id: stage
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $env:LAZYMIND_DESKTOP_UPDATE_CONFIG = Join-Path $env:RUNNER_TEMP 'validation-update-config.json'
+          $env:LAZYMIND_PYTHON_COMPONENT_BASE_URL = $env:VALIDATION_BASE_URL + 'RAG/'
+          pwsh -NoProfile -NonInteractive -File desktop/scripts/build-windows-x64.ps1 stage-policy-installer
+          $appRoot = (Resolve-Path -LiteralPath 'desktop/dist/win-unpacked').Path
+          "app_root=$appRoot" >> $env:GITHUB_OUTPUT
+
+      - name: Seal the staged application with the test Ed25519 key
+        env:
+          APP_ROOT: ${{ steps.stage.outputs.app_root }}
+          VALIDATION_KEY_ID: ${{ vars.LAZYMIND_WINDOWS_TEST_UPDATE_POLICY_KEY_ID }}
+          WINDOWS_POLICY_UPDATE_PRIVATE_KEY: ${{ secrets.WINDOWS_TEST_UPDATE_POLICY_PRIVATE_KEY }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          if (-not $env:WINDOWS_POLICY_UPDATE_PRIVATE_KEY -or -not $env:VALIDATION_KEY_ID) { throw 'Missing the isolated Windows test signer' }
+          node desktop/scripts/windows-policy-release.mjs --app-root "$env:APP_ROOT" --key-id "$env:VALIDATION_KEY_ID"
+
+      - name: Pack sealed NSIS installer and record checksums
+        env:
+          APP_ROOT: ${{ steps.stage.outputs.app_root }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          pwsh -NoProfile -NonInteractive -File desktop/scripts/build-windows-x64.ps1 pack-policy-installer -Prepackaged "$env:APP_ROOT"
+
+          $installers = @(Get-ChildItem -LiteralPath 'desktop/dist' -File -Filter 'LazyMind-windows-x64-installer-*.exe')
+          if ($installers.Count -ne 1) { throw 'Expected exactly one Windows installer' }
+          $resources = Join-Path $env:APP_ROOT 'resources'
+          & (Join-Path $resources 'runtime/bin/lazymind-update-helper.exe') verify-identity
+          $artifact = 'desktop/dist/package-validation'
+          $installer = $installers[0].FullName
+          node desktop/scripts/prepare-update-release.mjs `
+            --resources "$resources" --package "$installer" --base-url "$env:VALIDATION_BASE_URL" `
+            --minimum-system-version 10.0.19045 --output "$artifact/releases"
+          $artifactRoot = (Resolve-Path -LiteralPath $artifact).Path
+          Get-ChildItem -LiteralPath "$artifact/releases" -File -Recurse | ForEach-Object {
+            $relative = [IO.Path]::GetRelativePath($artifactRoot, $_.FullName).Replace('\', '/')
+            '{0}  {1}' -f (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant(), $relative
+          } | Set-Content -LiteralPath "$artifact/SHA256SUMS.txt" -Encoding ascii
+          @'
+          Windows x64 package for manual testing in a disposable Windows profile or VM.
+          To start the test, install baseline A (0.5.401) from its releases\windows-amd64-0.5.401\package.exe.
+          Once B (0.5.402) is available on the isolated test update channel, use A's normal update flow.
+          After installation, run resources\runtime\bin\lazymind-update-helper.exe verify-identity from the installation directory.
+          The release record includes the public trust configuration. This workflow uploads its output to GitHub Actions artifacts.
+          '@ | Set-Content -LiteralPath "$artifact/README.txt" -Encoding utf8
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-x64-package-validation-${{ steps.validation.outputs.version }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: desktop/dist/package-validation/
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-x64-validation-components-${{ steps.validation.outputs.version }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: desktop/dist/python-components/windows-amd64/
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0

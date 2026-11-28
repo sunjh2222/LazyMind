@@ -129,8 +129,9 @@ def prepare(current, history, evidence, validator, output, *, repo=None, verify_
     if not records:
         raise PlanError('Current build must provide update release records')
     config = next(iter(records.values()))[0]['config']
-    mode = 'unsigned-test' if unsigned_test else 'official'
-    if config['mode'] != mode or config['updaterProtocol'] != 2:
+    mode = config['mode']
+    modes = ('unsigned-test',) if unsigned_test else ('official', 'windows-policy')
+    if mode not in modes or config['updaterProtocol'] != 2:
         raise PlanError('Automatic publication requires v2 records in the selected release mode')
     policy_url = config['policyURL']
     source = re.match(rf'^https://modelscope\.cn/datasets/({REPOSITORY})/resolve/master/', policy_url)
@@ -149,7 +150,16 @@ def prepare(current, history, evidence, validator, output, *, repo=None, verify_
         if platform in builds or build['version'] != config['version']:
             raise PlanError('Expected one artifact per platform/architecture for the new version')
         builds.add(platform)
-        for artifact in ('package', 'feed', 'components'):
+        artifacts = ['package', 'feed', 'components']
+        if mode == 'windows-policy':
+            manifest = record['release'].get('installedManifest')
+            if (platform != ('windows', 'amd64') or build['audience'] != 'official' or build['channel'] != 'stable'
+                    or not isinstance(manifest, dict) or type(manifest.get('size')) is not int
+                    or not 0 < manifest['size'] <= publisher.MAX_POLICY_BYTES
+                    or not re.fullmatch(r'[0-9a-f]{64}', manifest.get('sha256', ''))):
+                raise PlanError('Windows policy requires a signed installed manifest')
+            artifacts.append('installedManifest')
+        for artifact in artifacts:
             publisher.destination(record['release'][artifact]['url'], base)
 
     if fetch is None:

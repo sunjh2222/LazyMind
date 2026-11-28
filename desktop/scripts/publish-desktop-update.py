@@ -136,8 +136,13 @@ def publish(directory, policy_path, config_path, repo, *, api=None, fetch=None, 
         rid = release['releaseId']
         if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}', rid):
             raise ValueError('Invalid release ID')
-        for kind, filename in [('package', 'package.zip' if release['platform'] == 'darwin' else 'package.exe'),
-                               ('feed', 'feed.json'), ('components', 'components.json')]:
+        artifacts = [('package', 'package.zip' if release['platform'] == 'darwin' else 'package.exe'),
+                     ('feed', 'feed.json'), ('components', 'components.json')]
+        if config.get('mode') == 'windows-policy':
+            if not isinstance(release.get('installedManifest'), dict):
+                raise ValueError('Missing installed manifest descriptor')
+            artifacts.append(('installedManifest', 'installed-manifest.json'))
+        for kind, filename in artifacts:
             artifact = release[kind]
             target = destination(artifact['url'], base)
             if not target.endswith(f'/releases/{rid}/{filename}') or target in seen or target == policy_destination:

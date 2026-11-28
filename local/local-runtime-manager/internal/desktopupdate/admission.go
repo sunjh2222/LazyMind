@@ -227,7 +227,66 @@ func checkJournals(root string, scope UpdateScope) error {
 	return nil
 }
 
+func checkStartupFences(root string, scope UpdateScope) error {
+	if err := checkJournals(root, scope); err != nil {
+		return err
+	}
+	return checkWindowsInstallProofFence(root, scope)
+}
+
+func checkWindowsInstallProofFence(root string, scope UpdateScope) error {
+	record, err := ReadNativeRecord(root)
+	if err != nil {
+		return err
+	}
+	if record == nil || record.Mode != "windows-policy" ||
+		!(record.Phase == "repair" || record.Phase == "installing" && !record.WindowsInstallVerified) {
+		return nil
+	}
+	intersects, err := ScopesIntersect(scope, record.Scope)
+	if err != nil {
+		return err
+	}
+	if intersects {
+		return failure("update_in_progress", nil)
+	}
+	return nil
+}
+
+// StartInstalledIdentityHelper keeps the state stable until the installed
+// helper process has started. Its caller waits for the child outside the lock.
+func StartInstalledIdentityHelper(ctx context.Context, root, installation string, start func() error) error {
+	if runtime.GOOS != "windows" {
+		record, err := ReadNativeRecord(root)
+		if err != nil {
+			return err
+		}
+		if record == nil || record.Mode != "windows-policy" {
+			return start()
+		}
+	}
+	lock, err := nativeStateLock(ctx, root)
+	if err != nil {
+		return err
+	}
+	defer releaseLock(lock)
+	if err := checkWindowsInstallProofFence(root, UpdateScope{Installation: installation}); err != nil {
+		return err
+	}
+	return start()
+}
+
 func CheckStartup(ctx context.Context, root string, scope UpdateScope) error {
+	return checkAdmission(ctx, root, scope, true)
+}
+
+// CheckRuntimeUpdateAdmission keeps the journal guard for existing runtime
+// operations, including the source shutdown after installation begins.
+func CheckRuntimeUpdateAdmission(ctx context.Context, root string, scope UpdateScope) error {
+	return checkAdmission(ctx, root, scope, false)
+}
+
+func checkAdmission(ctx context.Context, root string, scope UpdateScope, checkWindowsProof bool) error {
 	root, err := canonicalPath(root)
 	if err != nil {
 		return err
@@ -246,6 +305,9 @@ func CheckStartup(ctx context.Context, root string, scope UpdateScope) error {
 		return err
 	}
 	defer releaseLock(lock)
+	if checkWindowsProof {
+		return checkStartupFences(root, scope)
+	}
 	return checkJournals(root, scope)
 }
 
@@ -267,7 +329,7 @@ func RegisterCoordinatorScope(ctx context.Context, root string, scope UpdateScop
 		return err
 	}
 	defer releaseLock(lock)
-	if err = checkJournals(root, scope); err != nil {
+	if err = checkStartupFences(root, scope); err != nil {
 		return err
 	}
 	dir := filepath.Join(root, "startup", "v1")
