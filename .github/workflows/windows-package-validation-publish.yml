@@ -18,90 +18,19 @@ permissions:
 env:
   VALIDATION_REPO: sunjh2222/LazyMind
   VALIDATION_BRANCH: ci/windows-update-validation
-  VALIDATION_DATASET: sunjh2222/lazymind-updates
   A_RUN: '46113424979'
   A_SHA: 75ab8d6ff69a9284388ed0efc4690735b3fcb0d5
   B_RUN: '46126980513'
   B_SHA: a4cc8954a295da0fa7aefa80cb282d8bd3be39fc
+  FORMAT_RUN: '46128541793'
+  FORMAT_SHA: 6ddc43fe676a19caafdd3b432280cbe189494707
+  FORMAT_JOB: '140928435140'
+  FORMAT_ARTIFACT: '15257161830'
+  FORMAT_DIGEST: sha256:8631d593a411afdbd79b7c5946506b4fdb283a97dd86c1080d6855742eb1513c
 
 jobs:
-  format:
-    if: github.repository == 'sunjh2222/LazyMind' && github.ref == 'refs/heads/ci/windows-update-validation'
-    name: Verify the original data format on Windows
-    runs-on: windows-2025
-    timeout-minutes: 120
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-      - name: Match both successful packaging runs to their committed source
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          check_run() {
-            local actual expected
-            actual="$(gh api "repos/${VALIDATION_REPO}/actions/runs/$1/attempts/1" --jq '[.head_repository.full_name, .head_branch, .head_sha, .run_attempt, .conclusion, .path] | @tsv')"
-            expected="$(printf '%s\t%s\t%s\t1\tsuccess\t.github/workflows/windows-package-validation.yml' "$VALIDATION_REPO" "$VALIDATION_BRANCH" "$2")"
-            if [[ "$actual" != "$expected" && "$actual" != "$expected@refs/heads/$VALIDATION_BRANCH" ]]; then
-              echo 'Unexpected packaging run identity or unsuccessful run' >&2
-              exit 1
-            fi
-          }
-          check_run "$A_RUN" "$A_SHA"
-          check_run "$B_RUN" "$B_SHA"
-      - uses: actions/download-artifact@v8
-        with:
-          github-token: ${{ github.token }}
-          repository: ${{ env.VALIDATION_REPO }}
-          run-id: ${{ env.A_RUN }}
-          name: windows-x64-package-validation-0.5.401-${{ env.A_RUN }}-1
-          path: validation/a
-      - uses: actions/download-artifact@v8
-        with:
-          github-token: ${{ github.token }}
-          repository: ${{ env.VALIDATION_REPO }}
-          run-id: ${{ env.A_RUN }}
-          name: windows-x64-validation-components-0.5.401-${{ env.A_RUN }}-1
-          path: validation/a-components
-      - uses: actions/download-artifact@v8
-        with:
-          github-token: ${{ github.token }}
-          repository: ${{ env.VALIDATION_REPO }}
-          run-id: ${{ env.B_RUN }}
-          name: windows-x64-package-validation-0.5.402-${{ env.B_RUN }}-1
-          path: validation/b
-      - uses: actions/download-artifact@v8
-        with:
-          github-token: ${{ github.token }}
-          repository: ${{ env.VALIDATION_REPO }}
-          run-id: ${{ env.B_RUN }}
-          name: windows-x64-validation-components-0.5.402-${{ env.B_RUN }}-1
-          path: validation/b-components
-      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
-        with:
-          version: '0.11.31'
-          enable-cache: false
-      - name: Check independently installed A and B against the same read-only index
-        shell: bash
-        run: |
-          set -euo pipefail
-          uv run --no-project --python 3.11 python desktop/scripts/verify-update-format.py \
-            --source validation/a/releases/windows-amd64-0.5.401 \
-            --target validation/b/releases/windows-amd64-0.5.402 \
-            --source-components-dir validation/a-components --target-components-dir validation/b-components \
-            --output validation/format-evidence.json
-      - uses: actions/upload-artifact@v7
-        with:
-          name: windows-validation-format
-          path: validation/format-evidence.json
-          if-no-files-found: error
-          overwrite: true
-
   publish:
     if: github.repository == 'sunjh2222/LazyMind' && github.ref == 'refs/heads/ci/windows-update-validation'
-    needs: format
     name: Sign and publish only the Windows validation round
     runs-on: ubuntu-latest
     environment: desktop_updates_test
@@ -110,6 +39,28 @@ jobs:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
+      - name: Verify the original build and successful native format artifact provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          check_run() {
+            local actual expected
+            actual="$(gh api "repos/${VALIDATION_REPO}/actions/runs/$1/attempts/1" --jq '[.head_repository.full_name, .head_branch, .head_sha, .run_attempt, .conclusion, .path] | @tsv')"
+            expected="$(printf '%s\t%s\t%s\t1\t%s\t.github/workflows/%s' "$VALIDATION_REPO" "$VALIDATION_BRANCH" "$2" "$3" "$4")"
+            if [[ "$actual" != "$expected" && "$actual" != "$expected@refs/heads/$VALIDATION_BRANCH" ]]; then
+              echo 'Unexpected validation run identity or conclusion' >&2
+              exit 1
+            fi
+          }
+          check_run "$A_RUN" "$A_SHA" success windows-package-validation.yml
+          check_run "$B_RUN" "$B_SHA" success windows-package-validation.yml
+          check_run "$FORMAT_RUN" "$FORMAT_SHA" failure windows-package-validation-publish.yml
+          job="$(gh api "repos/${VALIDATION_REPO}/actions/jobs/$FORMAT_JOB" --jq '[.run_id, .conclusion, .name] | @tsv')"
+          [[ "$job" == "$(printf '%s\tsuccess\tVerify the original data format on Windows' "$FORMAT_RUN")" ]]
+          artifact="$(gh api "repos/${VALIDATION_REPO}/actions/artifacts/$FORMAT_ARTIFACT" --jq '[.id, .name, .expired, .digest, .workflow_run.id, .workflow_run.head_sha, .workflow_run.head_branch] | @tsv')"
+          [[ "$artifact" == "$(printf '%s\twindows-validation-format\tfalse\t%s\t%s\t%s\t%s' "$FORMAT_ARTIFACT" "$FORMAT_DIGEST" "$FORMAT_RUN" "$FORMAT_SHA" "$VALIDATION_BRANCH")" ]]
+
       - uses: actions/download-artifact@v8
         with:
           github-token: ${{ github.token }}
@@ -140,7 +91,11 @@ jobs:
           path: validation/b-components
       - uses: actions/download-artifact@v8
         with:
-          name: windows-validation-format
+          github-token: ${{ github.token }}
+          repository: ${{ env.VALIDATION_REPO }}
+          run-id: ${{ env.FORMAT_RUN }}
+          artifact-ids: ${{ env.FORMAT_ARTIFACT }}
+          merge-multiple: true
           path: validation
       - uses: actions/setup-go@v6
         with:
@@ -193,11 +148,8 @@ jobs:
           MODELSCOPE_API_TOKEN: ${{ secrets.MODELSCOPE_UPDATE_TOKEN }}
         run: |
           set -euo pipefail
-          plan="$RUNNER_TEMP/validation-plan"
-          uv run --no-project --python 3.11 --with modelscope-hub==0.4.6 python desktop/scripts/publish-desktop-update.py \
-            --directory validation --repo "$VALIDATION_DATASET" --validator "$RUNNER_TEMP/update-publisher" \
-            --expected-policy-sha256 "$(cat "$plan/expected-policy-sha256")" \
-            --policy "$plan/policy.json" --config "$plan/policy-config.json"
+          uv run --no-project --python 3.11 --with modelscope-hub==0.4.6 python desktop/scripts/publish-windows-package-validation.py publish-releases \
+            --artifacts validation --validator "$RUNNER_TEMP/update-publisher" --output "$RUNNER_TEMP/validation-plan"
       - uses: actions/upload-artifact@v7
         with:
           name: windows-validation-policy-${{ github.run_attempt }}

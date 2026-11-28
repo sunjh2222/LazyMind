@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import runpy
 import tempfile
+import time
 from urllib.error import HTTPError
 from urllib.request import build_opener
 
@@ -18,6 +19,7 @@ REPO = 'sunjh2222/lazymind-updates'
 DATASET = f'https://modelscope.cn/datasets/{REPO}/resolve/master/'
 BASE = DATASET + 'updates/windows-policy-validation/v1/'
 VERSIONS = ('0.5.401', '0.5.402')
+READBACK_DELAYS = (1, 2, 4, 8, 15, 30, 30)
 PLANNER = runpy.run_path(str(Path(__file__).with_name('prepare-update-ci-plan.py')))
 PUBLISHER = PLANNER['publisher']
 VERIFY = runpy.run_path(str(Path(__file__).with_name('verify-python-components.py')))
@@ -30,6 +32,40 @@ class ValidationError(ValueError):
 def require(condition, message):
     if not condition:
         raise ValidationError(message)
+
+
+class ValidationPublishClient:
+    def __init__(self, download):
+        self.download = download
+        self.api = None
+        self.uploaded = set()
+
+    def upload_file(self, *, repo_id, repo_type, path_or_fileobj, path_in_repo, revision, commit_message):
+        require(repo_id == REPO and repo_type == 'dataset' and revision == 'master', 'Unexpected validation upload repository')
+        url = DATASET + path_in_repo
+        PUBLISHER.destination(url, BASE)
+        if self.api is None:
+            token = os.environ.get('MODELSCOPE_API_TOKEN')
+            require(token, 'Missing the validation dataset write token')
+            from modelscope_hub import HubApi
+            self.api = HubApi(token=token, endpoint='https://modelscope.cn')
+        self.api.upload_file(repo_id=repo_id, repo_type=repo_type, path_or_fileobj=path_or_fileobj,
+                             path_in_repo=path_in_repo, revision=revision, commit_message=commit_message)
+        self.uploaded.add(url)
+
+    def fetch(self, url):
+        PUBLISHER.destination(url, BASE)
+        delays = iter(READBACK_DELAYS if url in self.uploaded else ())
+        self.uploaded.discard(url)
+        while True:
+            try:
+                return self.download(url)
+            except HTTPError as error:
+                wait = next(delays, None)
+                if error.code != 404 or wait is None:
+                    raise
+                error.close()
+                time.sleep(wait)
 
 
 def load_inputs(artifacts):
@@ -86,9 +122,13 @@ def load_inputs(artifacts):
     return records, catalogs, archives
 
 
-def read_policy(config):
+def pinned_fetch(config):
     opener = build_opener(PUBLISHER.PinnedRedirects(config['allowedOrigins']))
-    fetch = lambda url: opener.open(url, timeout=60)
+    return lambda url: opener.open(url, timeout=60)
+
+
+def read_policy(config):
+    fetch = pinned_fetch(config)
     return fetch, PUBLISHER.read_remote_policy(fetch, config['policyURL'])
 
 
@@ -129,9 +169,11 @@ def prepare(artifacts, evidence_path, validator, output):
 def publish_components(artifacts, output):
     records, catalogs, archives = load_inputs(artifacts)
     config = records[0]['config']
-    fetch, prior = read_policy(config)
+    download, prior = read_policy(config)
     expected = (output / 'expected-policy-sha256').read_text(encoding='ascii').strip()
     require(digest_or_absent(prior) == expected, 'Validation policy changed before component publication')
+    client = ValidationPublishClient(download)
+    fetch = client.fetch
 
     def present(url, descriptor):
         try:
@@ -156,15 +198,11 @@ def publish_components(artifacts, output):
             require(current is None or current in choices, 'Unexpected existing catalog in validation component path')
             if current != choices[-1]:
                 pointers.append((url, sources[-1], choices[-1], current))
-        require(os.environ.get('MODELSCOPE_API_TOKEN'), 'Missing the validation dataset write token')
-        from modelscope_hub import HubApi
-        api = HubApi(token=os.environ['MODELSCOPE_API_TOKEN'], endpoint='https://modelscope.cn')
-
         def upload(url, source):
             require(url.startswith(BASE + 'RAG/'), 'Unexpected validation component upload path')
-            api.upload_file(repo_id=REPO, repo_type='dataset', path_or_fileobj=str(source),
-                            path_in_repo=PUBLISHER.destination(url, DATASET), revision='master',
-                            commit_message='Publish Windows package validation components')
+            client.upload_file(repo_id=REPO, repo_type='dataset', path_or_fileobj=str(source),
+                               path_in_repo=PUBLISHER.destination(url, DATASET), revision='master',
+                               commit_message='Publish Windows package validation components')
 
         for url, archive, descriptor in missing:
             upload(url, archive)
@@ -175,9 +213,20 @@ def publish_components(artifacts, output):
             require(PUBLISHER.read_remote_policy(fetch, url) == data, 'Uploaded validation catalog failed public readback')
 
 
+def publish_releases(artifacts, output, validator):
+    config_path = output / 'policy-config.json'
+    config, _ = PLANNER['read_json'](config_path)
+    require(config['policyURL'] == BASE + 'policy.json', 'Unexpected Windows validation policy URL')
+    client = ValidationPublishClient(pinned_fetch(config))
+    expected = (output / 'expected-policy-sha256').read_text(encoding='ascii').strip()
+    PUBLISHER.publish(artifacts, output / 'policy.json', config_path, REPO, api=client, fetch=client.fetch,
+                      validator=validator.resolve(), expected_policy_sha256=expected)
+    print('Windows validation release files and signed policy publicly verified.', flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=('prepare', 'publish-components'))
+    parser.add_argument('command', choices=('prepare', 'publish-components', 'publish-releases'))
     parser.add_argument('--artifacts', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--evidence', type=Path)
@@ -187,8 +236,11 @@ def main():
         if args.command == 'prepare':
             require(args.evidence and args.validator, 'Prepare requires native format evidence and a policy validator')
             prepare(args.artifacts, args.evidence, args.validator, args.output)
-        else:
+        elif args.command == 'publish-components':
             publish_components(args.artifacts, args.output)
+        else:
+            require(args.validator, 'Publishing releases requires a policy validator')
+            publish_releases(args.artifacts, args.output, args.validator)
     except (ValidationError, PLANNER['PlanError']) as error:
         raise SystemExit(str(error)) from None
     except Exception:
